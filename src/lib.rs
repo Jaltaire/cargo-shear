@@ -387,7 +387,7 @@ impl<W: Write> CargoShear<W> {
     }
 
     /// Replace what the run observes of its surroundings.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) const fn with_surroundings(mut self, surroundings: Surroundings) -> Self {
         self.surroundings = surroundings;
         self

@@ -1,9 +1,10 @@
-use std::{fmt::Write, path::Path, process::ExitCode};
+use std::{fmt::Write, fs, io, path::Path, process::ExitCode};
 
 use rustc_hash::FxHashSet;
+use tempfile::TempDir;
 
 use crate::{
-    CargoShear, CargoShearOptions, cargo_shear_options, default_path,
+    CargoShear, CargoShearOptions, ResolveSource, cargo_shear_options, default_path,
     output::{ColorMode, OutputFormat},
     source_parser::ParsedSource,
 };
@@ -397,6 +398,61 @@ fn cargo_shear_with_different_options() {
     );
     let exit_code = shear.run();
     assert_eq!(exit_code, ExitCode::SUCCESS);
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> io::Result<()> {
+    if src.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_dir(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn cached_runs_match_uncached_runs_on_every_platform() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unused_workspace_renamed");
+    let temp_dir = TempDir::new().expect("A temporary directory should be created.");
+    copy_dir(&fixture, temp_dir.path()).expect("The fixture should be copied.");
+    let run = |cache: bool| {
+        let mut options =
+            CargoShearOptions::new(temp_dir.path().to_path_buf()).with_color(ColorMode::Never);
+        if cache {
+            options = options.with_cache();
+        }
+        let mut output = Vec::new();
+        let (exit_code, report) = CargoShear::new(&mut output, options).run_with_report();
+        let output = String::from_utf8(output).expect("The report should be UTF-8.");
+        (exit_code, output, report)
+    };
+
+    let (expected_exit_code, expected_output, report) = run(false);
+    assert_eq!(expected_exit_code, ExitCode::FAILURE, "The fixture should have findings.");
+    assert_eq!(report.resolve, ResolveSource::Uncached);
+
+    for round in 0..3 {
+        let (exit_code, output, report) = run(true);
+        assert_eq!(exit_code, expected_exit_code, "Round {round} should exit identically.");
+        assert_eq!(output, expected_output, "Round {round} should report identically.");
+        if !cfg!(unix) {
+            assert_eq!(
+                report.resolve,
+                ResolveSource::Uncacheable,
+                "The resolution should be cached only on Unix."
+            );
+        }
+        if round > 0 {
+            assert_eq!(
+                report.reused_files, report.parsed_files,
+                "Round {round} should reuse every parsed file."
+            );
+        }
+    }
 }
 
 #[test]
