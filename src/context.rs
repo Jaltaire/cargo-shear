@@ -3,7 +3,11 @@
 //! the dependency-name maps the analyzer needs to translate import names back
 //! to package names.
 
-use std::path::{Path, PathBuf};
+use std::{
+    cmp::Reverse,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Result, anyhow};
 use cargo_metadata::{Metadata, Package, Target};
@@ -115,13 +119,7 @@ impl WorkspaceContext {
         let paths: FxHashSet<PathBuf> =
             entry_points.iter().filter(|path| path.is_file()).cloned().chain(walked).collect();
 
-        let files: FxHashMap<PathBuf, ParsedSource> = paths
-            .into_par_iter()
-            .filter_map(|path| {
-                let is_entry_point = entry_points.contains(&path);
-                ParsedSource::from_path(&path, is_entry_point).ok().map(|source| (path, source))
-            })
-            .collect();
+        let files = Self::parse_files(paths, &entry_points);
 
         let linked: FxHashSet<PathBuf> = entry_points
             .into_iter()
@@ -172,6 +170,31 @@ impl WorkspaceContext {
             ignored_deps,
             hakari_packages,
         })
+    }
+
+    fn parse_files(
+        paths: FxHashSet<PathBuf>,
+        entry_points: &FxHashSet<PathBuf>,
+    ) -> FxHashMap<PathBuf, ParsedSource> {
+        let mut sources: Vec<(PathBuf, String)> = paths
+            .into_par_iter()
+            .filter_map(|path| read_to_string(&path).ok().map(|source| (path, source)))
+            .collect();
+        sources.sort_unstable_by_key(|(_, source)| Reverse(source.len()));
+
+        let next = AtomicUsize::new(0);
+        rayon::broadcast(|_| {
+            let mut parsed = Vec::new();
+            while let Some((path, source)) = sources.get(next.fetch_add(1, Ordering::Relaxed)) {
+                let is_entry_point = entry_points.contains(path);
+                parsed
+                    .push((path.clone(), ParsedSource::from_source(source, path, is_entry_point)));
+            }
+            parsed
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Identify the workspace members that are `cargo hakari` `workspace-hack`
@@ -281,5 +304,84 @@ impl<'a> PackageContext<'a> {
             pkg_to_import,
             ignored_imports,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use rustc_hash::{FxHashMap, FxHashSet};
+    use tempfile::TempDir;
+
+    use super::WorkspaceContext;
+    use crate::source_parser::ParsedSource;
+
+    fn parse_one_by_one(
+        paths: &FxHashSet<PathBuf>,
+        entry_points: &FxHashSet<PathBuf>,
+    ) -> FxHashMap<PathBuf, ParsedSource> {
+        paths
+            .iter()
+            .filter_map(|path| {
+                let source = String::from_utf8(fs::read(path).ok()?).ok()?;
+                let parsed = ParsedSource::from_source(&source, path, entry_points.contains(path));
+                Some((path.clone(), parsed))
+            })
+            .collect()
+    }
+
+    fn write(paths: &mut FxHashSet<PathBuf>, root: &Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, contents).unwrap();
+        paths.insert(path.clone());
+        path
+    }
+
+    #[test]
+    fn parse_files_parses_every_readable_file_exactly_once() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let mut paths = FxHashSet::default();
+        let lib = write(&mut paths, root, "lib.rs", b"mod a;\nuse serde::Serialize;\n");
+        let main = write(&mut paths, root, "main.rs", b"mod a;\nfn main() {}\n");
+        write(&mut paths, root, "a.rs", b"mod b;\nuse anyhow::Result;\n");
+        write(&mut paths, root, "big.rs", "use regex::Regex;\n".repeat(5_000).as_bytes());
+        write(&mut paths, root, "empty.rs", b"");
+        write(&mut paths, root, "invalid.rs", &[0xff, 0xfe, b'\n']);
+        paths.insert(root.join("missing.rs"));
+        let entry_points: FxHashSet<PathBuf> = [lib, main].into_iter().collect();
+
+        let expected = parse_one_by_one(&paths, &entry_points);
+        assert_eq!(expected.len(), 5, "Every readable file should be parsed.");
+
+        let actual = WorkspaceContext::parse_files(paths, &entry_points);
+        assert_eq!(actual, expected, "Parsing by size should parse each file as before.");
+    }
+
+    #[test]
+    fn parse_files_distinguishes_entry_points() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let mut paths = FxHashSet::default();
+        let entry = write(&mut paths, root, "entry.rs", b"mod child;\n");
+        let nested = write(&mut paths, root, "nested.rs", b"mod child;\n");
+        let entry_points: FxHashSet<PathBuf> = std::iter::once(entry.clone()).collect();
+
+        let actual = WorkspaceContext::parse_files(paths.clone(), &entry_points);
+        assert_eq!(actual, parse_one_by_one(&paths, &entry_points));
+        assert_ne!(
+            actual[&entry].paths, actual[&nested].paths,
+            "An entry point and a nested module should resolve `mod child;` differently."
+        );
+    }
+
+    #[test]
+    fn parse_files_of_nothing_is_empty() {
+        let parsed = WorkspaceContext::parse_files(FxHashSet::default(), &FxHashSet::default());
+        assert!(parsed.is_empty(), "No paths should parse to no files.");
     }
 }

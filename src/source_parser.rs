@@ -6,10 +6,7 @@
     reason = "Hundreds of SyntaxKind variants, matching on '_' is the best option"
 )]
 
-use std::{
-    io,
-    path::{Path as StdPath, PathBuf},
-};
+use std::path::{Path as StdPath, PathBuf};
 
 use compact_str::CompactString;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
@@ -23,10 +20,8 @@ use ra_ap_syntax::{
 };
 use rustc_hash::FxHashSet;
 
-use crate::util::read_to_string;
-
 /// Everything `SourceParser` extracts from one Rust source file.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct ParsedSource {
     /// External-crate names this file imports (deduplicated, normalised to import form).
     /// `CompactString` inlines names up to 24 bytes, so most crate names avoid a heap
@@ -48,11 +43,10 @@ pub struct ParsedSource {
 }
 
 impl ParsedSource {
-    /// Read `path` from disk and parse it. `is_entry_point` toggles entry-point
+    /// Parse `source`, the contents of `path`. `is_entry_point` toggles entry-point
     /// behaviour for `mod` resolution (see [`SourceParser::new`]).
-    pub fn from_path(path: &StdPath, is_entry_point: bool) -> io::Result<Self> {
-        let source = read_to_string(path)?;
-        Ok(SourceParser::parse(&source, Some(path), is_entry_point))
+    pub fn from_source(source: &str, path: &StdPath, is_entry_point: bool) -> Self {
+        SourceParser::parse(source, Some(path), is_entry_point)
     }
 
     /// Parse `source` directly. Treats `path` as an entry point — for
