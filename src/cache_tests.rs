@@ -1,6 +1,8 @@
 //! Tests for `--cache`: every run with the cache must report and fix exactly
 //! what a run without it does, and every input the cache depends on must
-//! invalidate it.
+//! invalidate it. The resolution cache exists only on Unix.
+
+#![cfg(unix)]
 
 use std::{
     collections::BTreeMap,
