@@ -20,25 +20,30 @@
 //! 2. The watched files ([`Watched`]), known only after a full resolution:
 //!    the manifest of every package outside the workspace, the
 //!    `Cargo.toml` files above path and git packages that cargo searches for a
-//!    workspace root to inherit from, and the directories cargo infers a path
-//!    package's targets from.
+//!    workspace root to inherit from, the directories cargo infers a path
+//!    package's targets from, whether each other package has a `src/lib.rs`,
+//!    the `.cargo-ok` markers cargo checks before trusting an unpacked
+//!    registry package or git checkout, and the registry index cache entry
+//!    cargo resolves each registry package from.
 //!
 //! An entry is written only when the primary key computed after the full
 //! `cargo metadata` run equals the one computed before it (so cargo neither
-//! rewrote `Cargo.lock` nor saw different members), and when no input changed
+//! rewrote `Cargo.lock` nor saw different members), when no input changed
 //! within [`RECENT_CHANGE_WINDOW`](crate::cache::RECENT_CHANGE_WINDOW) of the
-//! run's start (so what was recorded is what cargo read).
+//! run's start (so what was recorded is what cargo read), and when the full
+//! run printed exactly what the `--no-deps` run printed (so replaying the
+//! latter on a hit prints what cargo would have).
 
 use std::{
     env,
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{Result, anyhow};
 use cargo_metadata::{Metadata, Package, PackageId};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
@@ -143,10 +148,16 @@ pub struct KeyContext {
 
 impl KeyContext {
     /// Capture the context of this process. `None` when the run must not be
-    /// cached: the executable cannot be read, or the environment enables an
+    /// cached: the platform has no status-change time to tell whether a file
+    /// was written during the run (see [`Newest`]), the executable cannot be
+    /// read, the environment enables an
     /// unstable cargo feature that might make cargo read inputs this cache
-    /// does not know about.
+    /// does not know about, or the cargo binary cannot be identified (see
+    /// [`cargo_identity`]).
     pub fn capture(flags: [bool; 3], cwd: &Path) -> Option<Self> {
+        if !cfg!(unix) {
+            return None;
+        }
         let executable = crate::cache::executable_digest()?;
         let cwd = cwd.canonicalize().ok()?;
         let env = relevant_env(env::vars_os());
@@ -184,30 +195,93 @@ fn unstable_env(name: &OsString) -> bool {
     name.starts_with(b"CARGO_UNSTABLE_") && name != b"CARGO_UNSTABLE_BINDEPS"
 }
 
-/// Identify the cargo binary `cargo metadata` will run. When cargo-shear runs
-/// as `cargo shear`, cargo passes its own path in `CARGO`, and that file's
-/// metadata identifies it. Otherwise `cargo` is looked up on `PATH`, usually
-/// as a rustup proxy whose toolchain depends on the directory, so the version
-/// it reports from that directory identifies it.
-fn cargo_identity(env: &[(OsString, OsString)], cwd: &Path) -> Option<Vec<u8>> {
-    let cargo = env.iter().find(|(name, _)| name == "CARGO").map(|(_, value)| value);
-    if let Some(cargo) = cargo {
-        let mut newest = Newest::default();
-        let path = Path::new(cargo);
-        let digest = stat_digest(path, &mut newest);
-        let mut identity = b"binary ".to_vec();
-        identity.extend_from_slice(path.as_os_str().as_encoded_bytes());
-        identity.extend_from_slice(&digest);
-        return Some(identity);
-    }
-
-    let output = Command::new("cargo").arg("-vV").current_dir(cwd).output().ok()?;
-    if !output.status.success() {
+/// Identify the cargo binary `cargo metadata` will run: the one named by
+/// `CARGO`, which cargo sets to its own path when it runs `cargo shear`. Its
+/// path and file metadata identify it, since installing a toolchain replaces
+/// the file.
+///
+/// `None` (do not cache) when `CARGO` is unset, so that `cargo` would be found
+/// on `PATH`, or when it names a rustup proxy or a script. Those choose which
+/// cargo to run each time they are called (from `rust-toolchain` files, rustup
+/// settings, and the toolchains installed), and the file itself does not
+/// change when that choice does.
+pub fn cargo_identity(env: &[(OsString, OsString)], cwd: &Path) -> Option<Vec<u8>> {
+    let cargo = env.iter().find(|(name, _)| name == "CARGO").map(|(_, value)| value)?;
+    let path = cwd.join(cargo).canonicalize().ok()?;
+    if is_rustup(&path, env, cwd) || is_script(&path) {
         return None;
     }
-    let mut identity = b"version ".to_vec();
-    identity.extend_from_slice(&output.stdout);
+
+    let mut newest = Newest::default();
+    let digest = stat_digest(&path, &mut newest);
+    let mut identity = b"binary ".to_vec();
+    identity.extend_from_slice(path.as_os_str().as_encoded_bytes());
+    identity.extend_from_slice(&digest);
     Some(identity)
+}
+
+/// True when `path` (canonical) is rustup itself, which is what every rustup
+/// proxy (`cargo`, `rustc`, ...) is: a link to it or a copy of it. Compared
+/// against the `rustup` in the cargo home directory and every `rustup` on
+/// `PATH`, by name and then by contents.
+fn is_rustup(path: &Path, env: &[(OsString, OsString)], cwd: &Path) -> bool {
+    let rustup = format!("rustup{}", env::consts::EXE_SUFFIX);
+    if path.file_name().is_some_and(|name| name == rustup.as_str()) {
+        return true;
+    }
+
+    let mut candidates: Vec<PathBuf> =
+        cargo_home(env, cwd).map(|home| home.join("bin").join(&rustup)).into_iter().collect();
+    if let Some((_, paths)) = env.iter().find(|(name, _)| name == "PATH") {
+        candidates.extend(env::split_paths(paths).map(|directory| directory.join(&rustup)));
+    }
+
+    let Ok(metadata) = fs::metadata(path) else { return true };
+    candidates.iter().any(|candidate| {
+        let Ok(candidate) = candidate.canonicalize() else { return false };
+        if candidate == path {
+            return true;
+        }
+        let Ok(candidate_metadata) = fs::metadata(&candidate) else { return false };
+        candidate_metadata.len() == metadata.len()
+            && match (fs::read(&candidate), fs::read(path)) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => true,
+            }
+    })
+}
+
+/// True when `path` is an interpreted script rather than a binary.
+fn is_script(path: &Path) -> bool {
+    let mut start = [0u8; 2];
+    match fs::File::open(path).and_then(|mut file| {
+        use std::io::Read;
+        file.read_exact(&mut start)
+    }) {
+        Ok(()) => start == *b"#!",
+        Err(_) => true,
+    }
+}
+
+/// The cargo home directory cargo uses: `CARGO_HOME` (relative to `cwd`) when
+/// set and not empty, otherwise `.cargo` in the home directory.
+fn cargo_home(env: &[(OsString, OsString)], cwd: &Path) -> Option<PathBuf> {
+    env.iter()
+        .find(|(name, value)| name == "CARGO_HOME" && !value.is_empty())
+        .map(|(_, value)| cwd.join(value))
+        .or_else(|| env::home_dir().map(|home| home.join(".cargo")))
+}
+
+/// What cargo printed, without the status lines it prints while it waits for
+/// another cargo process to release a lock, which depend on what else is
+/// running rather than on anything it read.
+pub fn without_lock_waits(printed: &[u8]) -> Vec<u8> {
+    printed
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| !line.trim_ascii_start().starts_with(b"Blocking waiting for file lock on "))
+        .flatten()
+        .copied()
+        .collect()
 }
 
 /// The primary key of a cache entry, with the newest modification time among
@@ -223,7 +297,11 @@ impl ResolveKey {
     /// `--no-deps` (before deciding whether to run a full resolution) or from
     /// a full resolution (to check that nothing changed in between). Only the
     /// parts both share are read. `None` when the configuration uses a cargo
-    /// feature that might read inputs this cache does not know about.
+    /// feature that might read inputs this cache does not know about:
+    /// `include`, unstable features other than `bindeps`, `paths` overrides
+    /// (cargo searches every directory below them for packages), and source
+    /// replacement (vendored and mirrored sources, which cargo verifies
+    /// against checksums of every file).
     pub fn compute(context: &KeyContext, metadata: &Metadata) -> Option<Self> {
         let mut fingerprint = Fingerprint::new("cargo-shear resolve key v1");
         let mut newest = Newest::default();
@@ -243,7 +321,7 @@ impl ResolveKey {
         for config in config_files(context) {
             fingerprint_contents(&mut fingerprint, &mut newest, &config);
             if let Some(table) = read_toml(&config) {
-                if table.contains_key("include") {
+                if ["include", "paths", "source"].iter().any(|key| table.contains_key(*key)) {
                     return None;
                 }
                 if let Some(unstable) = table.get("unstable").and_then(toml::Value::as_table)
@@ -285,7 +363,9 @@ impl ResolveKey {
         }
 
         for path in &patch_paths {
-            fingerprint_contents(&mut fingerprint, &mut newest, &path.join("Cargo.toml"));
+            for directory in path.ancestors() {
+                fingerprint_contents(&mut fingerprint, &mut newest, &directory.join("Cargo.toml"));
+            }
         }
 
         Some(Self { digest: fingerprint.finish(), newest })
@@ -302,13 +382,7 @@ fn config_files(context: &KeyContext) -> Vec<PathBuf> {
         files.push(directory.join(".cargo").join("config.toml"));
     }
 
-    let cargo_home = context
-        .env
-        .iter()
-        .find(|(name, value)| name == "CARGO_HOME" && !value.is_empty())
-        .map(|(_, value)| context.cwd.join(value))
-        .or_else(|| env::home_dir().map(|home| home.join(".cargo")));
-    if let Some(cargo_home) = cargo_home {
+    if let Some(cargo_home) = cargo_home(&context.env, &context.cwd) {
         files.push(cargo_home.join("config"));
         files.push(cargo_home.join("config.toml"));
     }
@@ -324,7 +398,8 @@ fn read_toml(path: &Path) -> Option<toml::Table> {
 /// Collect the directories named by `[patch.<source>.<name>] path`,
 /// `[replace.<spec>] path`, and `paths = [...]`, resolved against `base`.
 /// A patch whose version does not match goes unused and appears nowhere else,
-/// yet editing its manifest can bring it into the graph.
+/// yet editing its manifest, or the workspace manifest above it that it
+/// inherits its version from, can bring it into the graph.
 fn collect_override_paths(table: &toml::Table, base: &Path, paths: &mut Vec<PathBuf>) {
     let mut push = |value: &toml::Value| {
         if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
@@ -381,7 +456,9 @@ pub struct Watched {
 
 impl Watched {
     /// Gather everything outside the workspace that the full resolution read.
-    pub fn collect(metadata: &Metadata) -> Self {
+    /// `None` when a registry package's index cache entry is not where cargo
+    /// keeps it, so it cannot be watched.
+    pub fn collect(metadata: &Metadata) -> Option<Self> {
         let members: FxHashSet<&PackageId> = metadata.workspace_members.iter().collect();
         let mut paths: FxHashSet<WatchedPath> = FxHashSet::default();
 
@@ -392,12 +469,34 @@ impl Watched {
             let is_path = package.source.is_none();
             let is_git =
                 package.source.as_ref().is_some_and(|source| source.repr.starts_with("git+"));
-            let Some(directory) = manifest.parent() else { continue };
+            let is_registry = package.source.as_ref().is_some_and(|source| {
+                source.repr.starts_with("registry+") || source.repr.starts_with("sparse+")
+            });
+            let directory = manifest.parent()?;
 
             if is_path || is_git {
                 for ancestor in directory.ancestors().skip(1) {
                     paths.insert(WatchedPath::File(ancestor.join("Cargo.toml")));
                 }
+            }
+
+            if is_git {
+                for ancestor in directory.ancestors() {
+                    paths.insert(WatchedPath::File(ancestor.join(".cargo-ok")));
+                }
+            }
+
+            if !is_path {
+                paths.insert(WatchedPath::Presence(directory.join("src").join("lib.rs")));
+            }
+
+            if is_registry {
+                paths.insert(WatchedPath::File(directory.join(".cargo-ok")));
+                let entry = index_cache_entry(directory, package.name.as_str())?;
+                if !entry.is_file() {
+                    return None;
+                }
+                paths.insert(WatchedPath::File(entry));
             }
 
             if is_path {
@@ -425,24 +524,50 @@ impl Watched {
             }
         }
 
-        let mut newest = Newest::default();
         let mut entries: Vec<_> = paths
-            .into_iter()
+            .into_par_iter()
             .map(|path| {
+                let mut newest = Newest::default();
                 let digest = path.digest(&mut newest);
+                (path, digest, newest)
+            })
+            .collect();
+        entries.sort_by(|(left, ..), (right, ..)| left.cmp_key().cmp(&right.cmp_key()));
+
+        let mut newest = Newest::default();
+        let entries = entries
+            .into_iter()
+            .map(|(path, digest, observed)| {
+                newest.merge(observed);
                 (path, digest)
             })
             .collect();
-        entries.sort_by(|(left, _), (right, _)| left.cmp_key().cmp(&right.cmp_key()));
 
-        Self { entries, newest }
+        Some(Self { entries, newest })
     }
 
     /// True when every watched object still has its recorded digest.
-    fn unchanged(&self) -> bool {
-        let mut newest = Newest::default();
-        self.entries.iter().all(|(path, digest)| path.digest(&mut newest) == *digest)
+    pub fn unchanged(&self) -> bool {
+        self.entries.par_iter().all(|(path, digest)| path.digest(&mut Newest::default()) == *digest)
     }
+}
+
+/// Where cargo caches the index entry of the registry package unpacked in
+/// `directory` (`<registry>/src/<index>/<name>-<version>`):
+/// `<registry>/index/<index>/.cache/<prefix>/<name>`, with the name in lower
+/// case and the prefix cargo derives from it.
+pub fn index_cache_entry(directory: &Path, name: &str) -> Option<PathBuf> {
+    let index = directory.parent()?;
+    let registry = index.parent()?.parent()?;
+    let name = name.to_lowercase();
+    let prefix = match name.len() {
+        0 => return None,
+        1 => PathBuf::from("1"),
+        2 => PathBuf::from("2"),
+        3 => Path::new("3").join(name.get(..1)?),
+        _ => Path::new(name.get(..2)?).join(name.get(2..4)?),
+    };
+    Some(registry.join("index").join(index.file_name()?).join(".cache").join(prefix).join(name))
 }
 
 impl WatchedPath {
