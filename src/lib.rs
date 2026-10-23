@@ -64,9 +64,9 @@ use toml_edit::DocumentMut;
 
 pub use crate::output::{ColorMode, OutputFormat};
 use crate::{
-    cache::{CacheDir, executable_digest},
+    cache::{CacheDir, Digest, executable_digest},
     cargo_toml_editor::CargoTomlEditor,
-    context::{PackageContext, WorkspaceContext},
+    context::{PackageContext, ParseOutcome, WorkspaceContext},
     diagnostics::ShearAnalysis,
     output::Renderer,
     package_processor::{PackageAnalysis, PackageProcessor, WorkspaceAnalysis},
@@ -350,6 +350,64 @@ pub(crate) struct CacheReport {
     pub resolve: ResolveSource,
     pub parsed_files: usize,
     pub reused_files: usize,
+    /// Which metadata the workspace's sources were parsed from.
+    pub parsed_from: Option<ParsedFrom>,
+}
+
+/// Which `cargo metadata` result a run parsed the workspace's sources from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParsedFrom {
+    /// The members that `cargo metadata --no-deps` listed.
+    Members,
+    /// The full resolution, because there was no `--no-deps` result or it
+    /// listed different members.
+    Resolved,
+}
+
+/// A workspace context together with what parsing it through the parse cache
+/// produced.
+struct ParsedWorkspace {
+    workspace_ctx: WorkspaceContext,
+    parse_cache: Option<(CacheDir, Digest, ParseCache)>,
+    outcome: ParseOutcome,
+}
+
+/// What a run that missed the resolution cache needs to record the full
+/// resolution.
+struct CacheMiss<'a> {
+    context: &'a KeyContext,
+    before: &'a ResolveKey,
+    dir: &'a CacheDir,
+    warnings: &'a [u8],
+    started: SystemTime,
+}
+
+impl CacheMiss<'_> {
+    /// Record `resolved`, which the full `cargo metadata` run produced
+    /// together with `metadata` while printing `printed`, when it is safe to.
+    fn record(
+        &self,
+        metadata: &Metadata,
+        resolved: &ResolvedDeps,
+        printed: &[u8],
+    ) -> ResolveSource {
+        if resolve_cache::without_lock_waits(printed)
+            == resolve_cache::without_lock_waits(self.warnings)
+            && let Some(after) = ResolveKey::compute(self.context, metadata)
+            && after.digest == self.before.digest
+            && let Some(watched) = Watched::collect(metadata)
+        {
+            let mut newest = resolve_cache::newest_input(self.before, &watched);
+            newest.merge(after.newest);
+            if newest.settled_before(self.started)
+                && resolve_cache::store(self.dir, self.before, &watched, resolved, metadata)
+                    .is_some()
+            {
+                return ResolveSource::Recorded;
+            }
+        }
+        ResolveSource::Unrecorded
+    }
 }
 
 impl<W: Write> CargoShear<W> {
@@ -451,13 +509,9 @@ impl<W: Write> CargoShear<W> {
 
         let processor = PackageProcessor::new(self.options.expand, self.options.check_test_targets);
         let (metadata, resolved, workspace_ctx) = if self.options.cache {
-            let (metadata, resolved) = self.cached_metadata(&extra_opts)?;
-            let workspace_ctx = self.cached_workspace(&metadata)?;
-            (metadata, resolved, workspace_ctx)
+            self.cached_metadata(&extra_opts)?
         } else {
-            let (metadata, workspace_ctx) = self.overlapped_metadata(extra_opts)?;
-            let resolved = ResolvedDeps::from_metadata(&metadata);
-            (metadata, resolved, workspace_ctx)
+            self.uncached_metadata(&extra_opts)?
         };
 
         let packages = metadata.workspace_packages();
@@ -538,39 +592,59 @@ impl<W: Write> CargoShear<W> {
         Ok(())
     }
 
-    /// Run `cargo metadata` with full dependency resolution while the sources
-    /// of the members that `cargo metadata --no-deps` lists are parsed.
-    fn overlapped_metadata(&self, extra_opts: Vec<String>) -> Result<(Metadata, WorkspaceContext)> {
-        let mut metadata_command = MetadataCommand::new();
-        metadata_command
-            .features(CargoOpt::AllFeatures)
-            .current_dir(&self.options.path)
-            .other_options(extra_opts);
-        let mut members_command = metadata_command.clone();
-        members_command.no_deps();
-        metadata_command.verbose(true);
-
-        let (metadata, prefetched) = thread::scope(|scope| {
-            let resolved = scope.spawn(|| metadata_command.exec());
-            let prefetched = Self::prefetch_workspace(&members_command);
-            let metadata = resolved.join().unwrap_or_else(|payload| panic::resume_unwind(payload));
-            (metadata, prefetched)
-        });
-        let metadata = metadata.map_err(|e| anyhow::anyhow!("Metadata error: {e}"))?;
-
-        let workspace_ctx = match prefetched {
-            Some((members, workspace_ctx)) if Self::same_workspace(&members, &metadata) => {
-                workspace_ctx
-            }
-            _ => WorkspaceContext::new(&metadata, None)?.0,
-        };
-        Ok((metadata, workspace_ctx))
+    /// Run `cargo metadata` without resolving dependencies, returning the
+    /// metadata and what cargo printed. `None` when cargo fails or prints
+    /// no metadata.
+    fn members_metadata(path: &Path, extra_opts: &[String]) -> Option<(Metadata, Vec<u8>)> {
+        let output = Self::full_metadata_command(path, extra_opts)
+            .no_deps()
+            .cargo_command()
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = std::str::from_utf8(&output.stdout).ok()?;
+        let json = stdout.lines().find(|line| line.starts_with('{'))?;
+        let metadata = MetadataCommand::parse(json).ok()?;
+        Some((metadata, output.stderr))
     }
 
-    fn prefetch_workspace(command: &MetadataCommand) -> Option<(Metadata, WorkspaceContext)> {
-        let metadata = command.exec().ok()?;
-        let (workspace_ctx, _) = WorkspaceContext::new(&metadata, None).ok()?;
-        Some((metadata, workspace_ctx))
+    /// Run `resolve`, which runs `cargo metadata` with full dependency
+    /// resolution, on another thread while the sources of the members that
+    /// `members` lists are parsed. That parse is used only when its members
+    /// equal the resolved metadata's; otherwise, and when there are no
+    /// members to parse from, the sources are parsed from the resolved
+    /// metadata exactly as before.
+    fn resolve_while_parsing<T: Send>(
+        &mut self,
+        members: impl FnOnce() -> Option<Metadata>,
+        resolve: impl FnOnce() -> Result<(Metadata, T)> + Send,
+    ) -> Result<(Metadata, T, WorkspaceContext)> {
+        let this = &*self;
+        let (resolved, prefetched) = thread::scope(|scope| {
+            let resolved = scope.spawn(resolve);
+            let prefetched = members().and_then(|members| {
+                let parsed = this.parse_workspace(&members).ok()?;
+                Some((members, parsed))
+            });
+            let resolved = resolved.join().unwrap_or_else(|payload| panic::resume_unwind(payload));
+            (resolved, prefetched)
+        });
+        let (metadata, resolution) = resolved?;
+
+        let parsed = match prefetched {
+            Some((members, parsed)) if Self::same_workspace(&members, &metadata) => {
+                self.cache_report.parsed_from = Some(ParsedFrom::Members);
+                parsed
+            }
+            _ => {
+                self.cache_report.parsed_from = Some(ParsedFrom::Resolved);
+                self.parse_workspace(&metadata)?
+            }
+        };
+        let workspace_ctx = self.record_parse(parsed);
+        Ok((metadata, resolution, workspace_ctx))
     }
 
     fn same_workspace(members: &Metadata, metadata: &Metadata) -> bool {
@@ -582,41 +656,52 @@ impl<W: Write> CargoShear<W> {
     }
 
     /// Build the workspace context for `metadata`, parsing source files
-    /// through the parse cache.
-    fn cached_workspace(&mut self, metadata: &Metadata) -> Result<WorkspaceContext> {
-        let parse_cache = executable_digest().map(|executable| {
-            let dir = CacheDir::new(
-                metadata.target_directory.as_std_path(),
-                metadata.workspace_root.as_std_path(),
-            );
-            let cache = ParseCache::load(&dir, &executable);
-            (dir, executable, cache)
-        });
-        let (workspace_ctx, parse_outcome) =
+    /// through the parse cache when `--cache` is given.
+    fn parse_workspace(&self, metadata: &Metadata) -> Result<ParsedWorkspace> {
+        let parse_cache = if self.options.cache {
+            executable_digest().map(|executable| {
+                let dir = CacheDir::new(
+                    metadata.target_directory.as_std_path(),
+                    metadata.workspace_root.as_std_path(),
+                );
+                let cache = ParseCache::load(&dir, &executable);
+                (dir, executable, cache)
+            })
+        } else {
+            None
+        };
+        let (workspace_ctx, outcome) =
             WorkspaceContext::new(metadata, parse_cache.as_ref().map(|(_, _, cache)| cache))?;
+        Ok(ParsedWorkspace { workspace_ctx, parse_cache, outcome })
+    }
+
+    /// Record what parsing through the parse cache produced, and return the
+    /// workspace context.
+    fn record_parse(&mut self, parsed: ParsedWorkspace) -> WorkspaceContext {
+        let ParsedWorkspace { workspace_ctx, parse_cache, outcome } = parsed;
         if let Some((dir, executable, cache)) = &parse_cache {
-            self.cache_report.parsed_files = parse_outcome.entries.len();
-            self.cache_report.reused_files = parse_outcome.reused;
-            if cache.is_stale(parse_outcome.entries.iter()) {
-                let _ = parse_cache::store(dir, executable, parse_outcome.entries.iter());
+            self.cache_report.parsed_files = outcome.entries.len();
+            self.cache_report.reused_files = outcome.reused;
+            if cache.is_stale(outcome.entries.iter()) {
+                let _ = parse_cache::store(dir, executable, outcome.entries.iter());
             }
         }
-        Ok(workspace_ctx)
+        workspace_ctx
     }
 
     /// Run `cargo metadata` with full dependency resolution.
-    fn full_metadata(&self, extra_opts: &[String]) -> Result<Metadata> {
-        self.full_metadata_command(extra_opts)
+    fn full_metadata(path: &Path, extra_opts: &[String]) -> Result<Metadata> {
+        Self::full_metadata_command(path, extra_opts)
             .verbose(true)
             .exec()
             .map_err(|e| anyhow::anyhow!("Metadata error: {e}"))
     }
 
-    fn full_metadata_command(&self, extra_opts: &[String]) -> MetadataCommand {
+    fn full_metadata_command(path: &Path, extra_opts: &[String]) -> MetadataCommand {
         let mut command = MetadataCommand::new();
         command
             .features(CargoOpt::AllFeatures)
-            .current_dir(&self.options.path)
+            .current_dir(path)
             .other_options(extra_opts.to_vec());
         command
     }
@@ -627,11 +712,14 @@ impl<W: Write> CargoShear<W> {
     /// error, rather than written to it directly, and also returned. Only for
     /// a standard error that is not a terminal, which cargo writes to in the
     /// same way either way.
-    fn full_metadata_capturing_stderr(&self, extra_opts: &[String]) -> Result<(Metadata, Vec<u8>)> {
-        let output =
-            self.full_metadata_command(extra_opts).cargo_command().output().map_err(|e| {
-                anyhow::anyhow!("Metadata error: {}", cargo_metadata::Error::from(e))
-            })?;
+    fn full_metadata_capturing_stderr(
+        path: &Path,
+        extra_opts: &[String],
+    ) -> Result<(Metadata, Vec<u8>)> {
+        let output = Self::full_metadata_command(path, extra_opts)
+            .cargo_command()
+            .output()
+            .map_err(|e| anyhow::anyhow!("Metadata error: {}", cargo_metadata::Error::from(e)))?;
         let _ = io::stderr().write_all(&output.stderr);
 
         let parse = || -> std::result::Result<Metadata, cargo_metadata::Error> {
@@ -649,8 +737,27 @@ impl<W: Write> CargoShear<W> {
         Ok((metadata, output.stderr))
     }
 
-    /// Obtain the workspace metadata and its resolved dependencies through the
-    /// resolution cache (see [`resolve_cache`]).
+    /// Obtain the workspace metadata, its resolved dependencies, and the
+    /// workspace context without `--cache`.
+    ///
+    /// The full `cargo metadata` runs on another thread while the sources of
+    /// the members that `cargo metadata --no-deps` lists are parsed.
+    fn uncached_metadata(
+        &mut self,
+        extra_opts: &[String],
+    ) -> Result<(Metadata, ResolvedDeps, WorkspaceContext)> {
+        let path = self.options.path.clone();
+        let (metadata, (), workspace_ctx) = self.resolve_while_parsing(
+            || Self::members_metadata(&path, extra_opts).map(|(members, _)| members),
+            || Ok((Self::full_metadata(&path, extra_opts)?, ())),
+        )?;
+        let resolved = ResolvedDeps::from_metadata(&metadata);
+        Ok((metadata, resolved, workspace_ctx))
+    }
+
+    /// Obtain the workspace metadata, its resolved dependencies, and the
+    /// workspace context through the resolution cache (see
+    /// [`resolve_cache`]).
     ///
     /// `cargo metadata --no-deps` runs first and supplies the members, their
     /// targets, and the primary key. On a hit, its metadata is used together
@@ -658,80 +765,86 @@ impl<W: Write> CargoShear<W> {
     /// which an entry guarantees is what the full resolution printed. When
     /// standard error is a terminal, cargo would have colored that output, so
     /// a hit is taken only when there is none. Otherwise the full
-    /// `cargo metadata` runs as it does without `--cache`, and its result is
+    /// `cargo metadata` runs as it does without `--cache`, while the sources
+    /// of the members the `--no-deps` run listed are parsed, and its result is
     /// recorded when it is safe to.
-    fn cached_metadata(&mut self, extra_opts: &[String]) -> Result<(Metadata, ResolvedDeps)> {
+    fn cached_metadata(
+        &mut self,
+        extra_opts: &[String],
+    ) -> Result<(Metadata, ResolvedDeps, WorkspaceContext)> {
         let started = self.surroundings.started();
         let stderr_is_terminal = self.surroundings.stderr_is_terminal();
         let flags = [self.options.locked, self.options.offline, self.options.frozen];
-        let context = KeyContext::capture(flags, &self.options.path);
+        let path = self.options.path.clone();
 
-        let lookup = context.as_ref().and_then(|context| {
-            let output = MetadataCommand::new()
-                .features(CargoOpt::AllFeatures)
-                .no_deps()
-                .current_dir(&self.options.path)
-                .other_options(extra_opts.to_vec())
-                .cargo_command()
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let stdout = std::str::from_utf8(&output.stdout).ok()?;
-            let json = stdout.lines().find(|line| line.starts_with('{'))?;
-            let metadata = MetadataCommand::parse(json).ok()?;
-            let key = ResolveKey::compute(context, &metadata)?;
-            let dir = CacheDir::new(
-                metadata.target_directory.as_std_path(),
-                metadata.workspace_root.as_std_path(),
-            );
-            Some((metadata, key, dir, output.stderr))
-        });
-
-        let Some((mut no_deps, before, dir, warnings)) = lookup else {
+        let Some(context) = KeyContext::capture(flags, &path) else {
             self.cache_report.resolve = ResolveSource::Uncacheable;
-            let metadata = self.full_metadata(extra_opts)?;
-            let resolved = ResolvedDeps::from_metadata(&metadata);
-            return Ok((metadata, resolved));
+            return self.uncached_metadata(extra_opts);
         };
 
+        let Some((mut members, warnings)) = Self::members_metadata(&path, extra_opts) else {
+            self.cache_report.resolve = ResolveSource::Uncacheable;
+            let (metadata, (), workspace_ctx) = self.resolve_while_parsing(
+                || None,
+                || Ok((Self::full_metadata(&path, extra_opts)?, ())),
+            )?;
+            let resolved = ResolvedDeps::from_metadata(&metadata);
+            return Ok((metadata, resolved, workspace_ctx));
+        };
+
+        let Some(before) = ResolveKey::compute(&context, &members) else {
+            self.cache_report.resolve = ResolveSource::Uncacheable;
+            let (metadata, (), workspace_ctx) = self.resolve_while_parsing(
+                || Some(members),
+                || Ok((Self::full_metadata(&path, extra_opts)?, ())),
+            )?;
+            let resolved = ResolvedDeps::from_metadata(&metadata);
+            return Ok((metadata, resolved, workspace_ctx));
+        };
+        let dir = CacheDir::new(
+            members.target_directory.as_std_path(),
+            members.workspace_root.as_std_path(),
+        );
+
         if (warnings.is_empty() || !stderr_is_terminal)
-            && let Some(resolved) = resolve_cache::load(&dir, &before, &mut no_deps)
+            && let Some(resolved) = resolve_cache::load(&dir, &before, &mut members)
         {
             let _ = io::stderr().write_all(&warnings);
             self.cache_report.resolve = ResolveSource::Reused;
-            return Ok((no_deps, resolved));
+            self.cache_report.parsed_from = Some(ParsedFrom::Members);
+            let parsed = self.parse_workspace(&members)?;
+            let workspace_ctx = self.record_parse(parsed);
+            return Ok((members, resolved, workspace_ctx));
         }
 
         if stderr_is_terminal {
             self.cache_report.resolve = ResolveSource::Unobserved;
-            let metadata = self.full_metadata(extra_opts)?;
+            let (metadata, (), workspace_ctx) = self.resolve_while_parsing(
+                || Some(members),
+                || Ok((Self::full_metadata(&path, extra_opts)?, ())),
+            )?;
             let resolved = ResolvedDeps::from_metadata(&metadata);
-            return Ok((metadata, resolved));
+            return Ok((metadata, resolved, workspace_ctx));
         }
 
-        let (metadata, printed) = self.full_metadata_capturing_stderr(extra_opts)?;
-        let resolved = ResolvedDeps::from_metadata(&metadata);
-
-        self.cache_report.resolve = ResolveSource::Unrecorded;
-        if resolve_cache::without_lock_waits(&printed)
-            == resolve_cache::without_lock_waits(&warnings)
-            && let Some(context) = &context
-            && let Some(after) = ResolveKey::compute(context, &metadata)
-            && after.digest == before.digest
-            && let Some(watched) = Watched::collect(&metadata)
-        {
-            let mut newest = resolve_cache::newest_input(&before, &watched);
-            newest.merge(after.newest);
-            if newest.settled_before(started)
-                && resolve_cache::store(&dir, &before, &watched, &resolved, &metadata).is_some()
-            {
-                self.cache_report.resolve = ResolveSource::Recorded;
-            }
-        }
-
-        Ok((metadata, resolved))
+        let miss = CacheMiss {
+            context: &context,
+            before: &before,
+            dir: &dir,
+            warnings: &warnings,
+            started,
+        };
+        let (metadata, (resolved, source), workspace_ctx) = self.resolve_while_parsing(
+            || Some(members),
+            || {
+                let (metadata, printed) = Self::full_metadata_capturing_stderr(&path, extra_opts)?;
+                let resolved = ResolvedDeps::from_metadata(&metadata);
+                let source = miss.record(&metadata, &resolved, &printed);
+                Ok((metadata, (resolved, source)))
+            },
+        )?;
+        self.cache_report.resolve = source;
+        Ok((metadata, resolved, workspace_ctx))
     }
 
     fn process_package<'a>(

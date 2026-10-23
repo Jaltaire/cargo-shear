@@ -1392,13 +1392,11 @@ fn same_workspace_rejects_a_different_root() {
 }
 
 #[test]
-fn prefetch_workspace_fails_without_a_manifest() {
+fn members_metadata_fails_without_a_manifest() {
     let temp_dir = TempDir::new().expect("A temporary directory should be created.");
-    let mut command = MetadataCommand::new();
-    command.current_dir(temp_dir.path()).no_deps();
     assert!(
-        CargoShear::<Vec<u8>>::prefetch_workspace(&command).is_none(),
-        "A directory without a manifest should not be prefetched."
+        CargoShear::<Vec<u8>>::members_metadata(temp_dir.path(), &[]).is_none(),
+        "A directory without a manifest should not list any members."
     );
 }
 

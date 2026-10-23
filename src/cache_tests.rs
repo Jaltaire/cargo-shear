@@ -14,7 +14,7 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use tempfile::TempDir;
 
 use crate::{
-    CacheReport, CargoShear, CargoShearOptions, ResolveSource, Surroundings,
+    CacheReport, CargoShear, CargoShearOptions, ParsedFrom, ResolveSource, Surroundings,
     cache::{CacheDir, Newest, RECENT_CHANGE_WINDOW},
     output::{ColorMode, OutputFormat},
     resolve_cache::{
@@ -162,13 +162,16 @@ fn check_fixture(fixture: &Path, flags: Flags) {
 
     let reference = TempDir::new().unwrap();
     copy_dir(fixture, reference.path());
-    let expected = run(reference.path(), Flags { cache: false, ..flags }).0;
+    let (expected, report) = run(reference.path(), Flags { cache: false, ..flags });
     let expected_tree = snapshot(reference.path());
+    let parsed_from = (expected.exit_code != ExitCode::from(2)).then_some(ParsedFrom::Members);
+    assert_eq!(report.parsed_from, parsed_from, "{name}: an uncached run parsed elsewhere");
 
     let cold = TempDir::new().unwrap();
     copy_dir(fixture, cold.path());
-    let (actual, _) = run(cold.path(), Flags { cache: true, ..flags });
+    let (actual, report) = run(cold.path(), Flags { cache: true, ..flags });
     assert_eq!(actual, expected, "{name}: a run that fills the cache differs ({flags:?})");
+    assert_eq!(report.parsed_from, parsed_from, "{name}: a cold run parsed elsewhere");
     assert_eq!(snapshot(cold.path()), expected_tree, "{name}: a cold --fix differs ({flags:?})");
 
     let warm = TempDir::new().unwrap();
@@ -183,6 +186,7 @@ fn check_fixture(fixture: &Path, flags: Flags) {
 
     let (actual, report) = run(warm.path(), Flags { cache: true, ..flags });
     assert_eq!(report.resolve, ResolveSource::Reused, "{name}: the cache was not reused");
+    assert_eq!(report.parsed_from, parsed_from, "{name}: a warm run parsed elsewhere");
     assert_eq!(report.reused_files, report.parsed_files, "{name}: files were parsed again");
     assert_eq!(actual, expected, "{name}: a run from the cache differs ({flags:?})");
     assert_eq!(
@@ -299,6 +303,7 @@ name = "helper_lib"
 
         let (outcome, report) = cached(&workspace.root);
         assert_eq!(report.resolve, ResolveSource::Recorded);
+        assert_eq!(report.parsed_from, Some(ParsedFrom::Members));
         assert_eq!(report.reused_files, 0);
         assert_eq!(outcome, expected);
 
@@ -598,7 +603,47 @@ fn config_include_disables_the_cache() {
     write(&workspace.root, ".cargo/other.toml", "");
     let (outcome, report) = cached(&workspace.root);
     assert_eq!(report.resolve, ResolveSource::Uncacheable);
+    assert_eq!(report.parsed_from, Some(ParsedFrom::Members));
+    assert_eq!(report.reused_files, report.parsed_files);
     assert_eq!(outcome, uncached(&workspace.root));
+}
+
+#[test]
+fn uncached_runs_parse_while_resolving() {
+    let workspace = Workspace::new();
+    let (outcome, report) = run(&workspace.root, Flags::default());
+    assert_eq!(outcome.exit_code, ExitCode::FAILURE, "{}", outcome.output);
+    assert_eq!(report.resolve, ResolveSource::Uncached);
+    assert_eq!(report.parsed_from, Some(ParsedFrom::Members));
+    assert_eq!(report.parsed_files, 0, "Nothing is parsed through the cache without it.");
+}
+
+#[test]
+fn misses_parse_while_resolving_and_match_uncached_runs() {
+    let workspace = Workspace::warmed();
+    write(
+        &workspace.root,
+        "crates/alpha/Cargo.toml",
+        &format!(
+            "{}\n[dev-dependencies]\nhelper = {{ path = \"../../../outside/helper\" }}\n",
+            fs::read_to_string(workspace.root.join("crates/alpha/Cargo.toml")).unwrap()
+        ),
+    );
+    let (outcome, report) = cached(&workspace.root);
+    assert_eq!(report.resolve, ResolveSource::Recorded);
+    assert_eq!(report.parsed_from, Some(ParsedFrom::Members));
+    assert_eq!(report.reused_files, report.parsed_files, "The sources did not change.");
+    assert_eq!(outcome, uncached(&workspace.root));
+}
+
+#[test]
+fn runs_that_fail_to_resolve_parse_nothing() {
+    let dir = TempDir::new().unwrap();
+    for cache in [false, true] {
+        let (outcome, report) = run(dir.path(), Flags { cache, ..Flags::default() });
+        assert_eq!(outcome.exit_code, ExitCode::from(2));
+        assert_eq!(report.parsed_from, None);
+    }
 }
 
 #[test]
@@ -925,6 +970,7 @@ fn terminal_runs_are_never_recorded() {
     for _ in 0..2 {
         let (outcome, report) = run(&workspace.root, terminal);
         assert_eq!(report.resolve, ResolveSource::Unobserved);
+        assert_eq!(report.parsed_from, Some(ParsedFrom::Members));
         assert_eq!(outcome, expected);
     }
 }
