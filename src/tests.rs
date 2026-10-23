@@ -11,9 +11,10 @@ use tempfile::TempDir;
 
 use crate::{
     CargoShear, CargoShearOptions, cargo_shear_options,
-    context::{PackageContext, ResolveIndex, WorkspaceContext},
+    context::{PackageContext, WorkspaceContext},
     default_path,
     output::{ColorMode, OutputFormat},
+    resolve_cache::ResolvedDeps,
     source_parser::ParsedSource,
 };
 
@@ -173,6 +174,7 @@ fn test_lib() {
             expand: false,
             check_test_targets: false,
             deny_warnings: false,
+            cache: false,
             format: OutputFormat::Auto,
             color: ColorMode::Never,
         },
@@ -398,6 +400,7 @@ fn cargo_shear_with_different_options() {
             expand: false,
             check_test_targets: false,
             deny_warnings: false,
+            cache: false,
             format: OutputFormat::Auto,
             color: ColorMode::Never,
         },
@@ -422,6 +425,7 @@ fn cargo_shear_with_package_filter() {
             expand: false,
             check_test_targets: false,
             deny_warnings: false,
+            cache: false,
             format: OutputFormat::Auto,
             color: ColorMode::Never,
         },
@@ -446,6 +450,7 @@ fn cargo_shear_with_exclude_filter() {
             expand: false,
             check_test_targets: false,
             deny_warnings: false,
+            cache: false,
             format: OutputFormat::Auto,
             color: ColorMode::Never,
         },
@@ -468,6 +473,7 @@ fn cargo_shear_options_creation() {
         expand: true,
         check_test_targets: false,
         deny_warnings: false,
+        cache: false,
         format: OutputFormat::Auto,
         color: ColorMode::Never,
     };
@@ -633,6 +639,7 @@ fn test_cargo_shear_new() {
         expand: false,
         check_test_targets: false,
         deny_warnings: false,
+        cache: false,
         format: OutputFormat::Auto,
         color: ColorMode::Never,
     };
@@ -1294,16 +1301,18 @@ fn prefetched_workspace_matches_resolved_metadata_for_every_fixture() {
             fixture.display()
         );
 
-        let prefetched = WorkspaceContext::new(&members)
-            .expect("A workspace context should be built from member metadata.");
-        let expected = WorkspaceContext::new(&resolved)
-            .expect("A workspace context should be built from resolved metadata.");
+        let prefetched = WorkspaceContext::new(&members, None)
+            .expect("A workspace context should be built from member metadata.")
+            .0;
+        let expected = WorkspaceContext::new(&resolved, None)
+            .expect("A workspace context should be built from resolved metadata.")
+            .0;
         assert_same_workspace_context(&prefetched, &expected);
 
-        let resolve_index = ResolveIndex::new(&resolved);
+        let resolved_deps = ResolvedDeps::from_metadata(&resolved);
         for package in resolved.workspace_packages() {
-            let ctx = PackageContext::new(&expected, package, &resolve_index)
-                .expect("A package context should be built from the resolve index.");
+            let ctx = PackageContext::new(&expected, package, &resolved_deps)
+                .expect("A package context should be built from the resolved dependencies.");
             let (import_to_pkg, pkg_to_import) = reference_import_maps(&package.id, &resolved);
             assert_eq!(
                 ctx.import_to_pkg,
@@ -1398,12 +1407,13 @@ fn package_context_requires_a_resolve_graph() {
     let temp_dir =
         copy_fixture(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean"));
     let members = metadata(temp_dir.path(), true);
-    let workspace = WorkspaceContext::new(&members)
-        .expect("A workspace context should be built from member metadata.");
-    let resolve_index = ResolveIndex::new(&members);
+    let workspace = WorkspaceContext::new(&members, None)
+        .expect("A workspace context should be built from member metadata.")
+        .0;
+    let resolved_deps = ResolvedDeps::from_metadata(&members);
     let package = members.workspace_packages()[0];
 
-    let Err(error) = PackageContext::new(&workspace, package, &resolve_index) else {
+    let Err(error) = PackageContext::new(&workspace, package, &resolved_deps) else {
         panic!("A package context should not be built without a resolve graph.");
     };
     assert_eq!(
@@ -1418,8 +1428,9 @@ fn package_context_reports_a_package_missing_from_the_resolve_graph() {
     let temp_dir =
         copy_fixture(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean"));
     let mut resolved = metadata(temp_dir.path(), false);
-    let workspace = WorkspaceContext::new(&resolved)
-        .expect("A workspace context should be built from resolved metadata.");
+    let workspace = WorkspaceContext::new(&resolved, None)
+        .expect("A workspace context should be built from resolved metadata.")
+        .0;
     let package = resolved.workspace_packages()[0].clone();
     resolved
         .resolve
@@ -1427,9 +1438,9 @@ fn package_context_reports_a_package_missing_from_the_resolve_graph() {
         .expect("The resolved metadata should carry a resolve graph.")
         .nodes
         .retain(|node| node.id != package.id);
-    let resolve_index = ResolveIndex::new(&resolved);
+    let resolved_deps = ResolvedDeps::from_metadata(&resolved);
 
-    let Err(error) = PackageContext::new(&workspace, &package, &resolve_index) else {
+    let Err(error) = PackageContext::new(&workspace, &package, &resolved_deps) else {
         panic!("A package context should not be built for a package missing from the graph.");
     };
     assert_eq!(

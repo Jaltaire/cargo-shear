@@ -10,12 +10,18 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use cargo_metadata::{Metadata, Node, Package, PackageId, Target};
+use cargo_metadata::{Metadata, Package, Target};
 use ignore::{DirEntry, WalkBuilder};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{manifest::Manifest, source_parser::ParsedSource, util::read_to_string};
+use crate::{
+    manifest::Manifest,
+    parse_cache::{ParseCache, ParseEntry},
+    resolve_cache::ResolvedDeps,
+    source_parser::ParsedSource,
+    util::read_to_string,
+};
 
 /// Marker that `cargo hakari` writes into a `workspace-hack` crate's `Cargo.toml`
 /// to delimit its generated dependency section. Its presence uniquely identifies
@@ -56,8 +62,23 @@ pub struct WorkspaceContext {
     pub hakari_packages: FxHashSet<String>,
 }
 
+/// What parsing through a [`ParseCache`] produced: the entry recorded for every
+/// parsed file, and how many of them were reused.
+#[derive(Debug, Default)]
+pub struct ParseOutcome {
+    /// Every parsed file's cache entry, keyed by absolute path.
+    pub entries: FxHashMap<PathBuf, ParseEntry>,
+    /// How many files were reused from the cache rather than parsed.
+    pub reused: usize,
+}
+
 impl WorkspaceContext {
-    pub fn new(metadata: &Metadata) -> Result<Self> {
+    /// Build the workspace context, parsing source files through
+    /// `parse_cache` when given. The context is identical either way.
+    pub fn new(
+        metadata: &Metadata,
+        parse_cache: Option<&ParseCache>,
+    ) -> Result<(Self, ParseOutcome)> {
         let root = metadata.workspace_root.as_std_path().to_path_buf();
 
         let manifest_path = root.join("Cargo.toml");
@@ -120,7 +141,7 @@ impl WorkspaceContext {
         let paths: FxHashSet<PathBuf> =
             entry_points.iter().filter(|path| path.is_file()).cloned().chain(walked).collect();
 
-        let files = Self::parse_files(paths, &entry_points);
+        let (files, outcome) = Self::parse_files(paths, &entry_points, parse_cache);
 
         let linked: FxHashSet<PathBuf> = entry_points
             .into_iter()
@@ -159,19 +180,22 @@ impl WorkspaceContext {
 
         let hakari_packages = Self::detect_hakari_packages(metadata);
 
-        Ok(Self {
-            root,
-            manifest_path,
-            manifest_content,
-            manifest,
-            sorted_paths: Self::sort_paths(&files),
-            files,
-            linked,
-            packages,
-            dep_to_pkg,
-            ignored_deps,
-            hakari_packages,
-        })
+        Ok((
+            Self {
+                root,
+                manifest_path,
+                manifest_content,
+                manifest,
+                sorted_paths: Self::sort_paths(&files),
+                files,
+                linked,
+                packages,
+                dep_to_pkg,
+                ignored_deps,
+                hakari_packages,
+            },
+            outcome,
+        ))
     }
 
     fn sort_paths(files: &FxHashMap<PathBuf, ParsedSource>) -> Vec<PathBuf> {
@@ -208,29 +232,52 @@ impl WorkspaceContext {
         )
     }
 
+    /// Parse every source file, through `parse_cache` when given.
     fn parse_files(
         paths: FxHashSet<PathBuf>,
         entry_points: &FxHashSet<PathBuf>,
-    ) -> FxHashMap<PathBuf, ParsedSource> {
+        parse_cache: Option<&ParseCache>,
+    ) -> (FxHashMap<PathBuf, ParsedSource>, ParseOutcome) {
+        let mut outcome = ParseOutcome::default();
         let mut sources: Vec<(PathBuf, String)> = paths
             .into_par_iter()
             .filter_map(|path| read_to_string(&path).ok().map(|source| (path, source)))
             .collect();
         sources.sort_unstable_by_key(|(_, source)| Reverse(source.len()));
 
+        let Some(parse_cache) = parse_cache else {
+            let files = Self::largest_first(&sources, |path, source| {
+                ParsedSource::from_source(source, path, entry_points.contains(path))
+            })
+            .collect();
+            return (files, outcome);
+        };
+
+        let mut files = FxHashMap::default();
+        for (path, parsed) in Self::largest_first(&sources, |path, source| {
+            parse_cache.parse(path, source, entry_points.contains(path))
+        }) {
+            outcome.reused += usize::from(parsed.reused);
+            outcome.entries.insert(path.clone(), parsed.entry);
+            files.insert(path, parsed.source);
+        }
+        (files, outcome)
+    }
+
+    fn largest_first<T: Send>(
+        sources: &[(PathBuf, String)],
+        parse: impl Fn(&Path, &str) -> T + Sync,
+    ) -> impl Iterator<Item = (PathBuf, T)> {
         let next = AtomicUsize::new(0);
         rayon::broadcast(|_| {
             let mut parsed = Vec::new();
             while let Some((path, source)) = sources.get(next.fetch_add(1, Ordering::Relaxed)) {
-                let is_entry_point = entry_points.contains(path);
-                parsed
-                    .push((path.clone(), ParsedSource::from_source(source, path, is_entry_point)));
+                parsed.push((path.clone(), parse(path, source)));
             }
             parsed
         })
         .into_iter()
         .flatten()
-        .collect()
     }
 
     /// Identify the workspace members that are `cargo hakari` `workspace-hack`
@@ -247,30 +294,6 @@ impl WorkspaceContext {
             })
             .map(|pkg| pkg.name.to_string())
             .collect()
-    }
-}
-
-pub struct ResolveIndex<'a> {
-    nodes: Option<FxHashMap<&'a PackageId, &'a Node>>,
-    packages: FxHashMap<&'a PackageId, &'a Package>,
-}
-
-impl<'a> ResolveIndex<'a> {
-    pub fn new(metadata: &'a Metadata) -> Self {
-        let nodes = metadata.resolve.as_ref().map(|resolve| {
-            let mut nodes = FxHashMap::default();
-            for node in &resolve.nodes {
-                nodes.entry(&node.id).or_insert(node);
-            }
-            nodes
-        });
-
-        let mut packages = FxHashMap::default();
-        for package in &metadata.packages {
-            packages.entry(&package.id).or_insert(package);
-        }
-
-        Self { nodes, packages }
     }
 }
 
@@ -306,20 +329,13 @@ impl<'a> PackageContext<'a> {
     pub fn new(
         workspace: &'a WorkspaceContext,
         package: &Package,
-        resolve_index: &ResolveIndex<'_>,
+        resolved: &ResolvedDeps,
     ) -> Result<Self> {
         let manifest_path = package.manifest_path.as_std_path();
         let manifest_content = read_to_string(manifest_path)?;
         let manifest: Manifest = toml::from_str(&manifest_content)?;
 
-        let resolved = resolve_index
-            .nodes
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow!("`cargo_metadata::MetadataCommand::no_deps` should not be called.")
-            })?
-            .get(&package.id)
-            .ok_or_else(|| anyhow!("Package not found: {}", package.name))?;
+        let resolved = resolved.deps(package)?;
 
         let directory = manifest_path
             .parent()
@@ -329,15 +345,9 @@ impl<'a> PackageContext<'a> {
         let mut import_to_pkg = FxHashMap::default();
         let mut pkg_to_import = FxHashMap::default();
 
-        for dep in &resolved.deps {
-            if let Some(pkg) = resolve_index.packages.get(&dep.pkg) {
-                // Artifact/bindep dependencies have an empty `dep.name` in `cargo_metadata`.
-                // Fall back to the package name so the rest of the pipeline can match them.
-                let name =
-                    if dep.name.is_empty() { pkg.name.replace('-', "_") } else { dep.name.clone() };
-                import_to_pkg.insert(name.clone(), pkg.name.to_string());
-                pkg_to_import.insert(pkg.name.to_string(), name);
-            }
+        for dep in resolved {
+            import_to_pkg.insert(dep.import.clone(), dep.package.clone());
+            pkg_to_import.insert(dep.package.clone(), dep.import.clone());
         }
 
         // A package ignore applies only to its own package; a workspace ignore applies
@@ -383,7 +393,7 @@ mod tests {
     fn synthetic_workspace(paths: &[&str]) -> WorkspaceContext {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean");
         let metadata = MetadataCommand::new().current_dir(fixture).no_deps().exec().unwrap();
-        let mut workspace = WorkspaceContext::new(&metadata).unwrap();
+        let (mut workspace, _) = WorkspaceContext::new(&metadata, None).unwrap();
         workspace.files =
             paths.iter().map(|path| (PathBuf::from(path), ParsedSource::default())).collect();
         workspace.sorted_paths = WorkspaceContext::sort_paths(&workspace.files);

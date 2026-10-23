@@ -60,6 +60,14 @@ cargo shear --check-test-targets
 
 When set, cargo-shear warns when `test = false` is paired with source that contains tests (or `doctest = false` with source that contains doc tests), and — within a workspace — when `test` / `doctest` are left at their default of `true` for lib targets that contain none. Disabled by default; pair with `--fix` to automatically reconcile the flags.
 
+Reuse work from earlier runs, for example in a pre-commit hook:
+
+```bash
+cargo shear --cache --fix
+```
+
+With `--cache`, cargo-shear keeps the dependency resolution it reads from `cargo metadata` and what it parsed from each source file under `target/cargo-shear/`. A later run on an unchanged workspace then only needs `cargo metadata --no-deps`, and parses only the files whose contents changed. Every result is keyed on all of its inputs (the lockfile, every manifest and Cargo configuration file cargo would read, the cargo binary and its environment, and each file's exact contents), so the report and any fixes are identical to a run without `--cache`. Warnings that only cargo's resolver prints are not repeated on a run that reuses the resolution.
+
 ## Limitations
 
 > [!IMPORTANT]
