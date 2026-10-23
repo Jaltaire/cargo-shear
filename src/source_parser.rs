@@ -26,7 +26,7 @@ use rustc_hash::FxHashSet;
 use crate::util::read_to_string;
 
 /// Everything `SourceParser` extracts from one Rust source file.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct ParsedSource {
     /// External-crate names this file imports (deduplicated, normalised to import form).
     /// `CompactString` inlines names up to 24 bytes, so most crate names avoid a heap
