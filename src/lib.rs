@@ -45,7 +45,7 @@ pub mod util;
 
 use std::{
     env, fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
@@ -294,6 +294,30 @@ pub struct CargoShear<W> {
 
     /// What `--cache` reused and recorded during the run.
     cache_report: CacheReport,
+
+    /// What the run observes of its surroundings.
+    surroundings: Surroundings,
+}
+
+/// What a run observes of its surroundings, which tests replace.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Surroundings {
+    /// When the run started, or `None` for the current time.
+    pub started: Option<SystemTime>,
+    /// Whether standard error is a terminal, or `None` to ask the system.
+    pub stderr_is_terminal: Option<bool>,
+}
+
+impl Surroundings {
+    const SYSTEM: Self = Self { started: None, stderr_is_terminal: None };
+
+    fn started(self) -> SystemTime {
+        self.started.unwrap_or_else(SystemTime::now)
+    }
+
+    fn stderr_is_terminal(self) -> bool {
+        self.stderr_is_terminal.unwrap_or_else(|| io::stderr().is_terminal())
+    }
 }
 
 /// How a run obtained dependency resolution.
@@ -309,8 +333,13 @@ pub(crate) enum ResolveSource {
     /// Resolved by `cargo metadata` and recorded in the cache.
     Recorded,
     /// Resolved by `cargo metadata` and not recorded, because an input changed
-    /// while it ran or too recently to be sure what cargo read.
+    /// while it ran or too recently to be sure what cargo read, or because it
+    /// printed something the `--no-deps` run did not.
     Unrecorded,
+    /// Resolved by `cargo metadata` with its output going straight to a
+    /// terminal, as it does without `--cache`, so what it printed could not be
+    /// compared with the `--no-deps` run and nothing was recorded.
+    Unobserved,
 }
 
 /// What `--cache` reused and recorded during one run.
@@ -335,7 +364,13 @@ impl<W: Write> CargoShear<W> {
     #[must_use]
     pub fn new(writer: W, options: CargoShearOptions) -> Self {
         let analysis = ShearAnalysis::new(options.clone());
-        Self { writer, options, analysis, cache_report: CacheReport::default() }
+        Self {
+            writer,
+            options,
+            analysis,
+            cache_report: CacheReport::default(),
+            surroundings: Surroundings::SYSTEM,
+        }
     }
 
     /// Execute the full pipeline: analyze every selected package, optionally
@@ -349,6 +384,13 @@ impl<W: Write> CargoShear<W> {
     #[must_use]
     pub fn run(mut self) -> ExitCode {
         self.execute()
+    }
+
+    /// Replace what the run observes of its surroundings.
+    #[cfg(test)]
+    pub(crate) const fn with_surroundings(mut self, surroundings: Surroundings) -> Self {
+        self.surroundings = surroundings;
+        self
     }
 
     /// Run like [`run`](Self::run) and also return what `--cache` did.
@@ -516,13 +558,47 @@ impl<W: Write> CargoShear<W> {
 
     /// Run `cargo metadata` with full dependency resolution.
     fn full_metadata(&self, extra_opts: &[String]) -> Result<Metadata> {
-        MetadataCommand::new()
-            .features(CargoOpt::AllFeatures)
-            .current_dir(&self.options.path)
-            .other_options(extra_opts.to_vec())
+        self.full_metadata_command(extra_opts)
             .verbose(true)
             .exec()
             .map_err(|e| anyhow::anyhow!("Metadata error: {e}"))
+    }
+
+    fn full_metadata_command(&self, extra_opts: &[String]) -> MetadataCommand {
+        let mut command = MetadataCommand::new();
+        command
+            .features(CargoOpt::AllFeatures)
+            .current_dir(&self.options.path)
+            .other_options(extra_opts.to_vec());
+        command
+    }
+
+    /// Run `cargo metadata` with full dependency resolution exactly as
+    /// [`full_metadata`](Self::full_metadata) does, except that cargo's
+    /// standard error is collected and then copied to this process's standard
+    /// error, rather than written to it directly, and also returned. Only for
+    /// a standard error that is not a terminal, which cargo writes to in the
+    /// same way either way.
+    fn full_metadata_capturing_stderr(&self, extra_opts: &[String]) -> Result<(Metadata, Vec<u8>)> {
+        let output =
+            self.full_metadata_command(extra_opts).cargo_command().output().map_err(|e| {
+                anyhow::anyhow!("Metadata error: {}", cargo_metadata::Error::from(e))
+            })?;
+        let _ = io::stderr().write_all(&output.stderr);
+
+        let parse = || -> std::result::Result<Metadata, cargo_metadata::Error> {
+            if !output.status.success() {
+                return Err(cargo_metadata::Error::CargoMetadata { stderr: String::new() });
+            }
+            let stdout = std::str::from_utf8(&output.stdout)?;
+            let json = stdout
+                .lines()
+                .find(|line| line.starts_with('{'))
+                .ok_or(cargo_metadata::Error::NoJson)?;
+            MetadataCommand::parse(json)
+        };
+        let metadata = parse().map_err(|e| anyhow::anyhow!("Metadata error: {e}"))?;
+        Ok((metadata, output.stderr))
     }
 
     /// Obtain the workspace metadata and its resolved dependencies through the
@@ -530,11 +606,15 @@ impl<W: Write> CargoShear<W> {
     ///
     /// `cargo metadata --no-deps` runs first and supplies the members, their
     /// targets, and the primary key. On a hit, its metadata is used together
-    /// with the recorded resolution, and its warnings are passed through.
-    /// Otherwise the full `cargo metadata` runs exactly as it does without
-    /// `--cache`, and its result is recorded when it is safe to.
+    /// with the recorded resolution, and what it printed is passed through,
+    /// which an entry guarantees is what the full resolution printed. When
+    /// standard error is a terminal, cargo would have colored that output, so
+    /// a hit is taken only when there is none. Otherwise the full
+    /// `cargo metadata` runs as it does without `--cache`, and its result is
+    /// recorded when it is safe to.
     fn cached_metadata(&mut self, extra_opts: &[String]) -> Result<(Metadata, ResolvedDeps)> {
-        let started = SystemTime::now();
+        let started = self.surroundings.started();
+        let stderr_is_terminal = self.surroundings.stderr_is_terminal();
         let flags = [self.options.locked, self.options.offline, self.options.frozen];
         let context = KeyContext::capture(flags, &self.options.path);
 
@@ -568,21 +648,32 @@ impl<W: Write> CargoShear<W> {
             return Ok((metadata, resolved));
         };
 
-        if let Some(resolved) = resolve_cache::load(&dir, &before, &mut no_deps) {
+        if (warnings.is_empty() || !stderr_is_terminal)
+            && let Some(resolved) = resolve_cache::load(&dir, &before, &mut no_deps)
+        {
             let _ = io::stderr().write_all(&warnings);
             self.cache_report.resolve = ResolveSource::Reused;
             return Ok((no_deps, resolved));
         }
 
-        let metadata = self.full_metadata(extra_opts)?;
+        if stderr_is_terminal {
+            self.cache_report.resolve = ResolveSource::Unobserved;
+            let metadata = self.full_metadata(extra_opts)?;
+            let resolved = ResolvedDeps::from_metadata(&metadata);
+            return Ok((metadata, resolved));
+        }
+
+        let (metadata, printed) = self.full_metadata_capturing_stderr(extra_opts)?;
         let resolved = ResolvedDeps::from_metadata(&metadata);
 
         self.cache_report.resolve = ResolveSource::Unrecorded;
-        if let Some(context) = &context
+        if resolve_cache::without_lock_waits(&printed)
+            == resolve_cache::without_lock_waits(&warnings)
+            && let Some(context) = &context
             && let Some(after) = ResolveKey::compute(context, &metadata)
             && after.digest == before.digest
+            && let Some(watched) = Watched::collect(&metadata)
         {
-            let watched = Watched::collect(&metadata);
             let mut newest = resolve_cache::newest_input(&before, &watched);
             newest.merge(after.newest);
             if newest.settled_before(started)

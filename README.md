@@ -66,7 +66,9 @@ Reuse work from earlier runs, for example in a pre-commit hook:
 cargo shear --cache --fix
 ```
 
-With `--cache`, cargo-shear keeps the dependency resolution it reads from `cargo metadata` and what it parsed from each source file under `target/cargo-shear/`. A later run on an unchanged workspace then only needs `cargo metadata --no-deps`, and parses only the files whose contents changed. Every result is keyed on all of its inputs (the lockfile, every manifest and Cargo configuration file cargo would read, the cargo binary and its environment, and each file's exact contents), so the report and any fixes are identical to a run without `--cache`. Warnings that only cargo's resolver prints are not repeated on a run that reuses the resolution.
+With `--cache`, cargo-shear keeps the dependency resolution it reads from `cargo metadata` and what it parsed from each source file under `target/cargo-shear/`. A later run on an unchanged workspace then only needs `cargo metadata --no-deps`, and parses only the files whose contents changed. Every result is keyed on all of its inputs (the lockfile, every manifest and Cargo configuration file cargo would read, the packages outside the workspace and the registry index entries they were resolved from, the cargo binary and its environment, and each file's exact contents), so the report, any fixes, the lockfile, and everything cargo prints are identical to a run without `--cache`.
+
+The resolution is cached only on Unix, when cargo-shear runs as `cargo shear` (so that `CARGO` names the cargo binary rather than a rustup proxy), and when the Cargo configuration uses neither `include`, `paths` overrides, source replacement, nor unstable features other than `bindeps`. It is recorded only when cargo prints the same thing with and without resolving dependencies, and not while cargo writes to a terminal; a recorded resolution is reused in a terminal only when cargo prints nothing.
 
 ## Limitations
 

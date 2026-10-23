@@ -134,6 +134,11 @@ impl CacheDir {
         Self { path: target_directory.join("cargo-shear").join(name) }
     }
 
+    #[cfg(test)]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Read a cache file. A missing or unreadable file reads as `None`.
     pub fn read(&self, name: &str) -> Option<Vec<u8>> {
         fs::read(self.path.join(name)).ok()
@@ -162,11 +167,19 @@ pub struct Newest {
 }
 
 impl Newest {
-    /// Record one input's metadata.
+    /// Record one input's metadata: its modification time and, where the
+    /// platform has one, its status-change time, which every write updates
+    /// and which, unlike the modification time, cannot be set back.
     pub fn observe(&mut self, metadata: &fs::Metadata) {
         match metadata.modified() {
             Ok(time) => self.observe_time(time),
             Err(_) => self.unknown = true,
+        }
+        if cfg!(unix) {
+            match status_change_time(metadata) {
+                Some(time) => self.observe_time(time),
+                None => self.unknown = true,
+            }
         }
     }
 
@@ -199,6 +212,20 @@ impl Newest {
             time.checked_add(RECENT_CHANGE_WINDOW).is_some_and(|settled| settled < started)
         })
     }
+}
+
+#[cfg(unix)]
+fn status_change_time(metadata: &fs::Metadata) -> Option<SystemTime> {
+    use std::os::unix::fs::MetadataExt;
+
+    let seconds = u64::try_from(metadata.ctime()).ok()?;
+    let nanoseconds = u32::try_from(metadata.ctime_nsec()).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::new(seconds, nanoseconds))
+}
+
+#[cfg(not(unix))]
+const fn status_change_time(_: &fs::Metadata) -> Option<SystemTime> {
+    None
 }
 
 /// Mix the exact contents of `path` (or its absence) into `fingerprint`.
