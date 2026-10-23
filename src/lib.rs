@@ -41,9 +41,11 @@ pub mod util;
 use std::{
     env, fs,
     io::Write,
+    panic,
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
+    thread,
 };
 
 use anyhow::Result;
@@ -57,7 +59,7 @@ use toml_edit::DocumentMut;
 pub use crate::output::{ColorMode, OutputFormat};
 use crate::{
     cargo_toml_editor::CargoTomlEditor,
-    context::{PackageContext, WorkspaceContext},
+    context::{PackageContext, ResolveIndex, WorkspaceContext},
     diagnostics::ShearAnalysis,
     output::Renderer,
     package_processor::{PackageAnalysis, PackageProcessor, WorkspaceAnalysis},
@@ -341,16 +343,31 @@ impl<W: Write> CargoShear<W> {
             extra_opts.push("--frozen".to_owned());
         }
 
-        let metadata = MetadataCommand::new()
+        let mut metadata_command = MetadataCommand::new();
+        metadata_command
             .features(CargoOpt::AllFeatures)
             .current_dir(&self.options.path)
-            .other_options(extra_opts)
-            .verbose(true)
-            .exec()
-            .map_err(|e| anyhow::anyhow!("Metadata error: {e}"))?;
+            .other_options(extra_opts);
+        let mut members_command = metadata_command.clone();
+        members_command.no_deps();
+        metadata_command.verbose(true);
+
+        let (metadata, prefetched) = thread::scope(|scope| {
+            let resolved = scope.spawn(|| metadata_command.exec());
+            let prefetched = Self::prefetch_workspace(&members_command);
+            let metadata = resolved.join().unwrap_or_else(|payload| panic::resume_unwind(payload));
+            (metadata, prefetched)
+        });
+        let metadata = metadata.map_err(|e| anyhow::anyhow!("Metadata error: {e}"))?;
 
         let processor = PackageProcessor::new(self.options.expand, self.options.check_test_targets);
-        let workspace_ctx = WorkspaceContext::new(&metadata)?;
+        let workspace_ctx = match prefetched {
+            Some((members, workspace_ctx)) if Self::same_workspace(&members, &metadata) => {
+                workspace_ctx
+            }
+            _ => WorkspaceContext::new(&metadata)?,
+        };
+        let resolve_index = ResolveIndex::new(&metadata);
 
         let packages = metadata.workspace_packages();
         let packages: Vec<_> = packages
@@ -389,7 +406,7 @@ impl<W: Write> CargoShear<W> {
                         total
                     );
 
-                    Self::process_package(&processor, &workspace_ctx, package, &metadata)
+                    Self::process_package(&processor, &workspace_ctx, package, &resolve_index)
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
@@ -397,7 +414,7 @@ impl<W: Write> CargoShear<W> {
             packages
                 .par_iter()
                 .map(|package| {
-                    Self::process_package(&processor, &workspace_ctx, package, &metadata)
+                    Self::process_package(&processor, &workspace_ctx, package, &resolve_index)
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -430,13 +447,27 @@ impl<W: Write> CargoShear<W> {
         Ok(())
     }
 
+    fn prefetch_workspace(command: &MetadataCommand) -> Option<(Metadata, WorkspaceContext)> {
+        let metadata = command.exec().ok()?;
+        let workspace_ctx = WorkspaceContext::new(&metadata).ok()?;
+        Some((metadata, workspace_ctx))
+    }
+
+    fn same_workspace(members: &Metadata, metadata: &Metadata) -> bool {
+        let mut expected = metadata.workspace_packages();
+        let mut prefetched = members.workspace_packages();
+        expected.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        prefetched.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        members.workspace_root == metadata.workspace_root && prefetched == expected
+    }
+
     fn process_package<'a>(
         processor: &PackageProcessor,
         workspace_ctx: &'a WorkspaceContext,
         package: &Package,
-        metadata: &'a Metadata,
+        resolve_index: &ResolveIndex<'_>,
     ) -> Result<(PackageContext<'a>, PackageAnalysis)> {
-        let ctx = PackageContext::new(workspace_ctx, package, metadata)?;
+        let ctx = PackageContext::new(workspace_ctx, package, resolve_index)?;
         let result = processor.process_package(&ctx)?;
         Ok((ctx, result))
     }

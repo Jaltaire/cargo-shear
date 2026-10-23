@@ -1,9 +1,18 @@
-use std::{fmt::Write, path::Path, process::ExitCode};
+use std::{
+    fmt::Write,
+    fs, io,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
-use rustc_hash::FxHashSet;
+use cargo_metadata::{CargoOpt, Metadata, MetadataCommand};
+use rustc_hash::{FxHashMap, FxHashSet};
+use tempfile::TempDir;
 
 use crate::{
-    CargoShear, CargoShearOptions, cargo_shear_options, default_path,
+    CargoShear, CargoShearOptions, cargo_shear_options,
+    context::{PackageContext, ResolveIndex, WorkspaceContext},
+    default_path,
     output::{ColorMode, OutputFormat},
     source_parser::ParsedSource,
 };
@@ -1179,4 +1188,271 @@ fn absolute_paths() {
 
     test_multiple_deps("use ::{foo, bar};", &["foo", "bar"]);
     test_multiple_deps("use ::{foo::bar, foo::baz};", &["foo"]);
+}
+
+fn fixtures() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures");
+    let mut fixtures: Vec<PathBuf> = fs::read_dir(root)
+        .expect("The fixtures directory should be readable.")
+        .map(|entry| entry.expect("A fixture entry should be readable.").path())
+        .filter(|path| path.join("Cargo.toml").is_file())
+        .collect();
+    fixtures.sort();
+    fixtures
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    if src.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_dir_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+fn copy_fixture(fixture: &Path) -> TempDir {
+    let temp_dir = TempDir::new().expect("A temporary directory should be created.");
+    copy_dir_recursive(fixture, temp_dir.path()).expect("The fixture should be copied.");
+    temp_dir
+}
+
+fn metadata(path: &Path, no_deps: bool) -> Metadata {
+    let mut command = MetadataCommand::new();
+    command
+        .cargo_path("cargo")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .features(CargoOpt::AllFeatures)
+        .current_dir(path);
+    if no_deps {
+        command.no_deps();
+    }
+    command.exec().expect("`cargo metadata` should succeed on a fixture.")
+}
+
+fn reference_import_maps(
+    package_id: &cargo_metadata::PackageId,
+    metadata: &Metadata,
+) -> (FxHashMap<String, String>, FxHashMap<String, String>) {
+    let resolved = metadata
+        .resolve
+        .as_ref()
+        .expect("The resolved metadata should carry a resolve graph.")
+        .nodes
+        .iter()
+        .find(|node| &node.id == package_id)
+        .expect("Every workspace member should have a resolve node.");
+
+    let mut import_to_pkg = FxHashMap::default();
+    let mut pkg_to_import = FxHashMap::default();
+    for dep in &resolved.deps {
+        if let Some(pkg) = metadata.packages.iter().find(|package| package.id == dep.pkg) {
+            let name =
+                if dep.name.is_empty() { pkg.name.replace('-', "_") } else { dep.name.clone() };
+            import_to_pkg.insert(name.clone(), pkg.name.to_string());
+            pkg_to_import.insert(pkg.name.to_string(), name);
+        }
+    }
+    (import_to_pkg, pkg_to_import)
+}
+
+#[track_caller]
+fn assert_same_workspace_context(actual: &WorkspaceContext, expected: &WorkspaceContext) {
+    assert_eq!(actual.root, expected.root, "The workspace roots should match.");
+    assert_eq!(actual.manifest_path, expected.manifest_path, "The manifest paths should match.");
+    assert_eq!(
+        actual.manifest_content, expected.manifest_content,
+        "The manifest contents should match."
+    );
+    assert_eq!(actual.files, expected.files, "The parsed source files should match.");
+    assert_eq!(actual.linked, expected.linked, "The linked files should match.");
+    assert_eq!(actual.packages, expected.packages, "The member directories should match.");
+    assert_eq!(actual.dep_to_pkg, expected.dep_to_pkg, "The workspace dependencies should match.");
+    assert_eq!(actual.ignored_deps, expected.ignored_deps, "The ignored entries should match.");
+    assert_eq!(
+        actual.hakari_packages, expected.hakari_packages,
+        "The hakari packages should match."
+    );
+}
+
+#[test]
+fn prefetched_workspace_matches_resolved_metadata_for_every_fixture() {
+    let fixtures = fixtures();
+    assert!(fixtures.len() > 40, "Every fixture should be discovered.");
+
+    for fixture in fixtures {
+        let temp_dir = copy_fixture(&fixture);
+        let resolved = metadata(temp_dir.path(), false);
+        let members = metadata(temp_dir.path(), true);
+
+        assert!(
+            CargoShear::<Vec<u8>>::same_workspace(&members, &resolved),
+            "The member metadata of {} should match its resolved metadata.",
+            fixture.display()
+        );
+
+        let prefetched = WorkspaceContext::new(&members)
+            .expect("A workspace context should be built from member metadata.");
+        let expected = WorkspaceContext::new(&resolved)
+            .expect("A workspace context should be built from resolved metadata.");
+        assert_same_workspace_context(&prefetched, &expected);
+
+        let resolve_index = ResolveIndex::new(&resolved);
+        for package in resolved.workspace_packages() {
+            let ctx = PackageContext::new(&expected, package, &resolve_index)
+                .expect("A package context should be built from the resolve index.");
+            let (import_to_pkg, pkg_to_import) = reference_import_maps(&package.id, &resolved);
+            assert_eq!(
+                ctx.import_to_pkg,
+                import_to_pkg,
+                "The import names of {} in {} should match.",
+                package.name,
+                fixture.display()
+            );
+            assert_eq!(
+                ctx.pkg_to_import,
+                pkg_to_import,
+                "The package names of {} in {} should match.",
+                package.name,
+                fixture.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn same_workspace_ignores_member_order() {
+    let temp_dir =
+        copy_fixture(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean_workspace"));
+    let resolved = metadata(temp_dir.path(), false);
+    let mut members = metadata(temp_dir.path(), true);
+    assert!(members.workspace_packages().len() > 1, "The fixture should have several members.");
+
+    members.packages.reverse();
+    assert!(
+        CargoShear::<Vec<u8>>::same_workspace(&members, &resolved),
+        "Member order should not matter."
+    );
+}
+
+#[test]
+fn same_workspace_rejects_a_changed_target() {
+    let temp_dir =
+        copy_fixture(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean_workspace"));
+    let resolved = metadata(temp_dir.path(), false);
+    let mut members = metadata(temp_dir.path(), true);
+
+    let target = &mut members.packages[0].targets[0];
+    target.src_path = target.src_path.with_file_name("moved.rs");
+    assert!(
+        !CargoShear::<Vec<u8>>::same_workspace(&members, &resolved),
+        "A moved target should not be treated as the same workspace."
+    );
+}
+
+#[test]
+fn same_workspace_rejects_a_missing_member() {
+    let temp_dir =
+        copy_fixture(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean_workspace"));
+    let resolved = metadata(temp_dir.path(), false);
+    let mut members = metadata(temp_dir.path(), true);
+
+    let removed = members.workspace_members.pop().expect("The fixture should have members.");
+    members.packages.retain(|package| package.id != removed);
+    assert!(
+        !CargoShear::<Vec<u8>>::same_workspace(&members, &resolved),
+        "A missing member should not be treated as the same workspace."
+    );
+}
+
+#[test]
+fn same_workspace_rejects_a_different_root() {
+    let temp_dir =
+        copy_fixture(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean"));
+    let resolved = metadata(temp_dir.path(), false);
+    let mut members = metadata(temp_dir.path(), true);
+
+    members.workspace_root = members.workspace_root.join("elsewhere");
+    assert!(
+        !CargoShear::<Vec<u8>>::same_workspace(&members, &resolved),
+        "A different workspace root should not be treated as the same workspace."
+    );
+}
+
+#[test]
+fn prefetch_workspace_fails_without_a_manifest() {
+    let temp_dir = TempDir::new().expect("A temporary directory should be created.");
+    let mut command = MetadataCommand::new();
+    command.current_dir(temp_dir.path()).no_deps();
+    assert!(
+        CargoShear::<Vec<u8>>::prefetch_workspace(&command).is_none(),
+        "A directory without a manifest should not be prefetched."
+    );
+}
+
+#[test]
+fn package_context_requires_a_resolve_graph() {
+    let temp_dir =
+        copy_fixture(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean"));
+    let members = metadata(temp_dir.path(), true);
+    let workspace = WorkspaceContext::new(&members)
+        .expect("A workspace context should be built from member metadata.");
+    let resolve_index = ResolveIndex::new(&members);
+    let package = members.workspace_packages()[0];
+
+    let Err(error) = PackageContext::new(&workspace, package, &resolve_index) else {
+        panic!("A package context should not be built without a resolve graph.");
+    };
+    assert_eq!(
+        error.to_string(),
+        "`cargo_metadata::MetadataCommand::no_deps` should not be called.",
+        "The missing resolve graph should be reported."
+    );
+}
+
+#[test]
+fn package_context_reports_a_package_missing_from_the_resolve_graph() {
+    let temp_dir =
+        copy_fixture(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean"));
+    let mut resolved = metadata(temp_dir.path(), false);
+    let workspace = WorkspaceContext::new(&resolved)
+        .expect("A workspace context should be built from resolved metadata.");
+    let package = resolved.workspace_packages()[0].clone();
+    resolved
+        .resolve
+        .as_mut()
+        .expect("The resolved metadata should carry a resolve graph.")
+        .nodes
+        .retain(|node| node.id != package.id);
+    let resolve_index = ResolveIndex::new(&resolved);
+
+    let Err(error) = PackageContext::new(&workspace, &package, &resolve_index) else {
+        panic!("A package context should not be built for a package missing from the graph.");
+    };
+    assert_eq!(
+        error.to_string(),
+        format!("Package not found: {}", package.name),
+        "The missing package should be reported."
+    );
+}
+
+#[test]
+fn metadata_errors_are_reported_when_the_manifest_is_invalid() {
+    let temp_dir = TempDir::new().expect("A temporary directory should be created.");
+    fs::write(temp_dir.path().join("Cargo.toml"), "[package\n")
+        .expect("The manifest should be written.");
+
+    let mut output = Vec::new();
+    let options = CargoShearOptions::new(temp_dir.path().to_path_buf());
+    let exit_code = CargoShear::new(&mut output, options).run();
+    let output = String::from_utf8(output).expect("The output should be UTF-8.");
+
+    assert_eq!(exit_code, ExitCode::from(2), "A metadata failure should be fatal.");
+    assert!(
+        output.starts_with("error: Metadata error: "),
+        "The metadata failure should be reported: {output}"
+    );
 }

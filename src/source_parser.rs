@@ -21,7 +21,7 @@ use ra_ap_syntax::{
 use rustc_hash::FxHashSet;
 
 /// Everything `SourceParser` extracts from one Rust source file.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct ParsedSource {
     /// External-crate names this file imports (deduplicated, normalised to import form).
     /// `CompactString` inlines names up to 24 bytes, so most crate names avoid a heap

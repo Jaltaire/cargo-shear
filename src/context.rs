@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use cargo_metadata::{Metadata, Package, Target};
+use cargo_metadata::{Metadata, Node, Package, PackageId, Target};
 use ignore::{DirEntry, WalkBuilder};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -250,6 +250,30 @@ impl WorkspaceContext {
     }
 }
 
+pub struct ResolveIndex<'a> {
+    nodes: Option<FxHashMap<&'a PackageId, &'a Node>>,
+    packages: FxHashMap<&'a PackageId, &'a Package>,
+}
+
+impl<'a> ResolveIndex<'a> {
+    pub fn new(metadata: &'a Metadata) -> Self {
+        let nodes = metadata.resolve.as_ref().map(|resolve| {
+            let mut nodes = FxHashMap::default();
+            for node in &resolve.nodes {
+                nodes.entry(&node.id).or_insert(node);
+            }
+            nodes
+        });
+
+        let mut packages = FxHashMap::default();
+        for package in &metadata.packages {
+            packages.entry(&package.id).or_insert(package);
+        }
+
+        Self { nodes, packages }
+    }
+}
+
 /// Per-package state derived from `cargo metadata` plus the package's own manifest.
 pub struct PackageContext<'a> {
     /// Shared workspace state (source file map, ignored deps, ...).
@@ -282,21 +306,19 @@ impl<'a> PackageContext<'a> {
     pub fn new(
         workspace: &'a WorkspaceContext,
         package: &Package,
-        metadata: &Metadata,
+        resolve_index: &ResolveIndex<'_>,
     ) -> Result<Self> {
         let manifest_path = package.manifest_path.as_std_path();
         let manifest_content = read_to_string(manifest_path)?;
         let manifest: Manifest = toml::from_str(&manifest_content)?;
 
-        let resolved = metadata
-            .resolve
+        let resolved = resolve_index
+            .nodes
             .as_ref()
             .ok_or_else(|| {
                 anyhow!("`cargo_metadata::MetadataCommand::no_deps` should not be called.")
             })?
-            .nodes
-            .iter()
-            .find(|node| node.id == package.id)
+            .get(&package.id)
             .ok_or_else(|| anyhow!("Package not found: {}", package.name))?;
 
         let directory = manifest_path
@@ -308,7 +330,7 @@ impl<'a> PackageContext<'a> {
         let mut pkg_to_import = FxHashMap::default();
 
         for dep in &resolved.deps {
-            if let Some(pkg) = metadata.packages.iter().find(|package| package.id == dep.pkg) {
+            if let Some(pkg) = resolve_index.packages.get(&dep.pkg) {
                 // Artifact/bindep dependencies have an empty `dep.name` in `cargo_metadata`.
                 // Fall back to the package name so the rest of the pipeline can match them.
                 let name =
