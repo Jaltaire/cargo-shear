@@ -3,7 +3,11 @@
 //! the dependency-name maps the analyzer needs to translate import names back
 //! to package names.
 
-use std::path::{Path, PathBuf};
+use std::{
+    cmp::Reverse,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Result, anyhow};
 use cargo_metadata::{Metadata, Package, Target};
@@ -116,13 +120,7 @@ impl WorkspaceContext {
         let paths: FxHashSet<PathBuf> =
             entry_points.iter().filter(|path| path.is_file()).cloned().chain(walked).collect();
 
-        let files: FxHashMap<PathBuf, ParsedSource> = paths
-            .into_par_iter()
-            .filter_map(|path| {
-                let is_entry_point = entry_points.contains(&path);
-                ParsedSource::from_path(&path, is_entry_point).ok().map(|source| (path, source))
-            })
-            .collect();
+        let files = Self::parse_files(paths, &entry_points);
 
         let linked: FxHashSet<PathBuf> = entry_points
             .into_iter()
@@ -208,6 +206,31 @@ impl WorkspaceContext {
                     .filter_map(|path| self.files.get_key_value(path))
             },
         )
+    }
+
+    fn parse_files(
+        paths: FxHashSet<PathBuf>,
+        entry_points: &FxHashSet<PathBuf>,
+    ) -> FxHashMap<PathBuf, ParsedSource> {
+        let mut sources: Vec<(PathBuf, String)> = paths
+            .into_par_iter()
+            .filter_map(|path| read_to_string(&path).ok().map(|source| (path, source)))
+            .collect();
+        sources.sort_unstable_by_key(|(_, source)| Reverse(source.len()));
+
+        let next = AtomicUsize::new(0);
+        rayon::broadcast(|_| {
+            let mut parsed = Vec::new();
+            while let Some((path, source)) = sources.get(next.fetch_add(1, Ordering::Relaxed)) {
+                let is_entry_point = entry_points.contains(path);
+                parsed
+                    .push((path.clone(), ParsedSource::from_source(source, path, is_entry_point)));
+            }
+            parsed
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Identify the workspace members that are `cargo hakari` `workspace-hack`
