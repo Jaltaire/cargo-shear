@@ -122,31 +122,12 @@ impl<'a> PackageAnalyzer<'a> {
             };
 
             let is_build_script = target.kind.contains(&TargetKind::CustomBuild);
-            let dir_bytes = if is_build_script {
-                target.src_path.as_os_str().as_encoded_bytes()
+            let src_path = target.src_path.as_std_path();
+            let matching_files: Vec<_> = if is_build_script {
+                self.ctx.workspace.file_at(src_path).into_iter().collect()
             } else {
-                target
-                    .src_path
-                    .parent()
-                    .map_or(target.src_path.as_os_str(), |p| p.as_os_str())
-                    .as_encoded_bytes()
+                self.ctx.workspace.files_in(src_path.parent().unwrap_or(src_path)).collect()
             };
-
-            let matching_files: Vec<_> = self
-                .ctx
-                .workspace
-                .files
-                .iter()
-                .filter(|(path, _)| {
-                    let path = path.as_os_str().as_encoded_bytes();
-                    if is_build_script {
-                        path == dir_bytes
-                    } else {
-                        path.starts_with(dir_bytes)
-                            && matches!(path.get(dir_bytes.len()), Some(&(b'/' | b'\\')))
-                    }
-                })
-                .collect();
 
             let imports: FxHashSet<CompactString> = matching_files
                 .iter()
@@ -264,12 +245,11 @@ impl<'a> PackageAnalyzer<'a> {
     }
 
     fn analyze_unlinked(&mut self) {
-        let dir_bytes = self.ctx.directory.as_os_str().as_encoded_bytes();
         self.result.unlinked_files = self
             .ctx
             .workspace
-            .files
-            .keys()
+            .files_in(&self.ctx.directory)
+            .map(|(path, _)| path)
             .filter(|path| {
                 // The workspace root walks every Rust file in the tree, including those
                 // owned by member packages. Don't double-count their files here.
@@ -283,28 +263,20 @@ impl<'a> PackageAnalyzer<'a> {
                     }
                 }
 
-                let path_bytes = path.as_os_str().as_encoded_bytes();
-                path_bytes.starts_with(dir_bytes)
-                    && matches!(path_bytes.get(dir_bytes.len()), Some(&(b'/' | b'\\')))
-                    && !self.ctx.workspace.linked.contains(*path)
+                !self.ctx.workspace.linked.contains(*path)
             })
             .cloned()
             .collect();
     }
 
     fn analyze_empty(&mut self) {
-        let dir_bytes = self.ctx.directory.as_os_str().as_encoded_bytes();
         self.result.empty_files = self
             .ctx
             .workspace
-            .files
-            .iter()
+            .files_in(&self.ctx.directory)
             .filter(|(path, parsed)| {
-                let path_bytes = path.as_os_str().as_encoded_bytes();
                 // Restrict to files inside this package that are reachable from a module tree.
-                path_bytes.starts_with(dir_bytes)
-                    && matches!(path_bytes.get(dir_bytes.len()), Some(&(b'/' | b'\\')))
-                    && self.ctx.workspace.linked.contains(*path)
+                self.ctx.workspace.linked.contains(*path)
                     && parsed.is_empty
                     // Entry points (lib.rs, main.rs, build.rs, ...) are routinely
                     // empty when scaffolding a new target — never warn on those.

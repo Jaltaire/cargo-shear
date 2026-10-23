@@ -33,6 +33,7 @@ pub struct WorkspaceContext {
 
     /// All Rust source files in the workspace, keyed by absolute path.
     pub files: FxHashMap<PathBuf, ParsedSource>,
+    sorted_paths: Vec<PathBuf>,
     /// Files reachable from at least one entry point's module tree.
     pub linked: FxHashSet<PathBuf>,
     /// Absolute directories of every workspace member.
@@ -165,6 +166,7 @@ impl WorkspaceContext {
             manifest_path,
             manifest_content,
             manifest,
+            sorted_paths: Self::sort_paths(&files),
             files,
             linked,
             packages,
@@ -172,6 +174,40 @@ impl WorkspaceContext {
             ignored_deps,
             hakari_packages,
         })
+    }
+
+    fn sort_paths(files: &FxHashMap<PathBuf, ParsedSource>) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = files.keys().cloned().collect();
+        paths.sort_unstable_by(|a, b| {
+            a.as_os_str().as_encoded_bytes().cmp(b.as_os_str().as_encoded_bytes())
+        });
+        paths
+    }
+
+    pub fn file_at(&self, path: &Path) -> Option<(&PathBuf, &ParsedSource)> {
+        self.files.get_key_value(path).filter(|(key, _)| {
+            key.as_os_str().as_encoded_bytes() == path.as_os_str().as_encoded_bytes()
+        })
+    }
+
+    pub fn files_in<'s>(
+        &'s self,
+        directory: &Path,
+    ) -> impl Iterator<Item = (&'s PathBuf, &'s ParsedSource)> + 's {
+        let directory = directory.as_os_str().as_encoded_bytes();
+        (*b"/\\").map(|separator| [directory, &[separator]].concat()).into_iter().flat_map(
+            move |prefix| {
+                let start = self.sorted_paths.partition_point(|path| {
+                    path.as_os_str().as_encoded_bytes() < prefix.as_slice()
+                });
+                self.sorted_paths[start..]
+                    .iter()
+                    .take_while(move |path| {
+                        path.as_os_str().as_encoded_bytes().starts_with(&prefix)
+                    })
+                    .filter_map(|path| self.files.get_key_value(path))
+            },
+        )
     }
 
     /// Identify the workspace members that are `cargo hakari` `workspace-hack`
@@ -281,5 +317,90 @@ impl<'a> PackageContext<'a> {
             pkg_to_import,
             ignored_imports,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use cargo_metadata::MetadataCommand;
+
+    use super::WorkspaceContext;
+    use crate::source_parser::ParsedSource;
+
+    fn sorted<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<&'a PathBuf> {
+        let mut paths: Vec<_> = paths.collect();
+        paths.sort();
+        paths
+    }
+
+    fn synthetic_workspace(paths: &[&str]) -> WorkspaceContext {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/clean");
+        let metadata = MetadataCommand::new().current_dir(fixture).no_deps().exec().unwrap();
+        let mut workspace = WorkspaceContext::new(&metadata).unwrap();
+        workspace.files =
+            paths.iter().map(|path| (PathBuf::from(path), ParsedSource::default())).collect();
+        workspace.sorted_paths = WorkspaceContext::sort_paths(&workspace.files);
+        workspace
+    }
+
+    const PATHS: &[&str] = &[
+        "/w/a/x.rs",
+        "/w/a\\y.rs",
+        "/w/a/b/c.rs",
+        "/w/a/b\\d.rs",
+        "/w/ab/z.rs",
+        "/w/a.rs",
+        "/w/a-/q.rs",
+        "/w/a0/q.rs",
+        "/w/a",
+        "/w/b/x.rs",
+        "/w/build.rs",
+        "/x.rs",
+        "relative/x.rs",
+        "relative\\y.rs",
+    ];
+
+    #[test]
+    fn files_in_matches_a_full_scan() {
+        let workspace = synthetic_workspace(PATHS);
+        let directories =
+            ["/w/a", "/w", "/w/a/b", "/w/ab", "/w/a-", "/", "", "/w/missing", "relative", "/w/a/"];
+
+        for directory in directories {
+            let directory = Path::new(directory);
+            let bytes = directory.as_os_str().as_encoded_bytes();
+            let expected: Vec<_> = sorted(workspace.files.keys().filter(|path| {
+                let path = path.as_os_str().as_encoded_bytes();
+                path.starts_with(bytes) && matches!(path.get(bytes.len()), Some(&(b'/' | b'\\')))
+            }));
+            let actual: Vec<_> = sorted(workspace.files_in(directory).map(|(path, _)| path));
+            assert_eq!(actual, expected, "Mismatch for {}.", directory.display());
+        }
+
+        let found = sorted(workspace.files_in(Path::new("/w/a")).map(|(path, _)| path));
+        assert_eq!(found.len(), 4, "Expected both separators and nested files.");
+    }
+
+    #[test]
+    fn file_at_matches_exact_bytes_only() {
+        let workspace = synthetic_workspace(PATHS);
+
+        for path in PATHS {
+            let (found, _) = workspace.file_at(Path::new(path)).unwrap();
+            assert_eq!(found.as_os_str(), *path);
+        }
+
+        for path in ["/w/./build.rs", "/w//build.rs", "/w/build.rs/", "/w/missing.rs"] {
+            let bytes = Path::new(path).as_os_str().as_encoded_bytes();
+            let expected =
+                workspace.files.keys().find(|key| key.as_os_str().as_encoded_bytes() == bytes);
+            assert_eq!(
+                workspace.file_at(Path::new(path)).map(|(key, _)| key),
+                expected,
+                "Mismatch for {path}."
+            );
+        }
     }
 }
