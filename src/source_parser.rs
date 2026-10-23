@@ -26,7 +26,7 @@ use rustc_hash::FxHashSet;
 use crate::util::read_to_string;
 
 /// Everything `SourceParser` extracts from one Rust source file.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ParsedSource {
     /// External-crate names this file imports (deduplicated, normalised to import form).
     /// `CompactString` inlines names up to 24 bytes, so most crate names avoid a heap
@@ -52,7 +52,13 @@ impl ParsedSource {
     /// behaviour for `mod` resolution (see [`SourceParser::new`]).
     pub fn from_path(path: &StdPath, is_entry_point: bool) -> io::Result<Self> {
         let source = read_to_string(path)?;
-        Ok(SourceParser::parse(&source, Some(path), is_entry_point))
+        Ok(Self::from_source(&source, path, is_entry_point))
+    }
+
+    /// Parse the already-read contents of the file at `path`, exactly as
+    /// [`from_path`](Self::from_path) parses what it reads.
+    pub fn from_source(source: &str, path: &StdPath, is_entry_point: bool) -> Self {
+        SourceParser::parse(source, Some(path), is_entry_point)
     }
 
     /// Parse `source` directly. Treats `path` as an entry point — for

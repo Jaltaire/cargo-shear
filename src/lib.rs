@@ -26,6 +26,9 @@
 //! let exit_code = CargoShear::new(std::io::stdout(), options).run();
 //! ```
 
+mod cache;
+#[cfg(test)]
+mod cache_tests;
 mod cargo_toml_editor;
 mod context;
 mod diagnostics;
@@ -33,6 +36,8 @@ mod manifest;
 mod output;
 mod package_analyzer;
 mod package_processor;
+mod parse_cache;
+mod resolve_cache;
 mod source_parser;
 #[cfg(test)]
 mod tests;
@@ -40,10 +45,11 @@ pub mod util;
 
 use std::{
     env, fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
+    time::SystemTime,
 };
 
 use anyhow::Result;
@@ -56,11 +62,14 @@ use toml_edit::DocumentMut;
 
 pub use crate::output::{ColorMode, OutputFormat};
 use crate::{
+    cache::{CacheDir, executable_digest},
     cargo_toml_editor::CargoTomlEditor,
     context::{PackageContext, WorkspaceContext},
     diagnostics::ShearAnalysis,
     output::Renderer,
     package_processor::{PackageAnalysis, PackageProcessor, WorkspaceAnalysis},
+    parse_cache::ParseCache,
+    resolve_cache::{KeyContext, ResolveKey, ResolvedDeps, Watched},
     util::read_to_string,
 };
 
@@ -105,6 +114,14 @@ pub struct CargoShearOptions {
     /// When set, warnings will cause cargo-shear to exit with a failure code.
     #[bpaf(long("deny-warnings"))]
     deny_warnings: bool,
+
+    /// Reuse dependency resolution and parsed sources from earlier runs.
+    ///
+    /// Results are kept under the target directory and reused only while every
+    /// input they were computed from is unchanged, so the report and any fixes
+    /// are identical to a run without this flag.
+    #[bpaf(long)]
+    cache: bool,
 
     /// Assert that `Cargo.lock` will remain unchanged.
     locked: bool,
@@ -153,6 +170,7 @@ impl CargoShearOptions {
             expand: false,
             check_test_targets: false,
             deny_warnings: false,
+            cache: false,
             locked: false,
             offline: false,
             frozen: false,
@@ -188,6 +206,13 @@ impl CargoShearOptions {
     #[must_use]
     pub const fn with_deny_warnings(mut self) -> Self {
         self.deny_warnings = true;
+        self
+    }
+
+    /// Enable `--cache`: reuse resolution and parsing from earlier runs.
+    #[must_use]
+    pub const fn with_cache(mut self) -> Self {
+        self.cache = true;
         self
     }
 
@@ -266,6 +291,34 @@ pub struct CargoShear<W> {
 
     /// Diagnostics accumulated as each package is processed.
     analysis: ShearAnalysis,
+
+    /// What `--cache` reused and recorded during the run.
+    cache_report: CacheReport,
+}
+
+/// How a run obtained dependency resolution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ResolveSource {
+    /// `--cache` was not given.
+    #[default]
+    Uncached,
+    /// `--cache` was given but this workspace's configuration cannot be cached.
+    Uncacheable,
+    /// Reused from the cache.
+    Reused,
+    /// Resolved by `cargo metadata` and recorded in the cache.
+    Recorded,
+    /// Resolved by `cargo metadata` and not recorded, because an input changed
+    /// while it ran or too recently to be sure what cargo read.
+    Unrecorded,
+}
+
+/// What `--cache` reused and recorded during one run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CacheReport {
+    pub resolve: ResolveSource,
+    pub parsed_files: usize,
+    pub reused_files: usize,
 }
 
 impl<W: Write> CargoShear<W> {
@@ -282,7 +335,7 @@ impl<W: Write> CargoShear<W> {
     #[must_use]
     pub fn new(writer: W, options: CargoShearOptions) -> Self {
         let analysis = ShearAnalysis::new(options.clone());
-        Self { writer, options, analysis }
+        Self { writer, options, analysis, cache_report: CacheReport::default() }
     }
 
     /// Execute the full pipeline: analyze every selected package, optionally
@@ -295,6 +348,17 @@ impl<W: Write> CargoShear<W> {
     /// - `2` if a fatal error occurred (cargo failure, IO error, ...).
     #[must_use]
     pub fn run(mut self) -> ExitCode {
+        self.execute()
+    }
+
+    /// Run like [`run`](Self::run) and also return what `--cache` did.
+    #[cfg(test)]
+    pub(crate) fn run_with_report(mut self) -> (ExitCode, CacheReport) {
+        let exit_code = self.execute();
+        (exit_code, self.cache_report)
+    }
+
+    fn execute(&mut self) -> ExitCode {
         match self.shear() {
             Ok(()) => {
                 let color = self.options.color.enabled();
@@ -341,16 +405,36 @@ impl<W: Write> CargoShear<W> {
             extra_opts.push("--frozen".to_owned());
         }
 
-        let metadata = MetadataCommand::new()
-            .features(CargoOpt::AllFeatures)
-            .current_dir(&self.options.path)
-            .other_options(extra_opts)
-            .verbose(true)
-            .exec()
-            .map_err(|e| anyhow::anyhow!("Metadata error: {e}"))?;
+        let (metadata, resolved) = if self.options.cache {
+            self.cached_metadata(&extra_opts)?
+        } else {
+            let metadata = self.full_metadata(&extra_opts)?;
+            let resolved = ResolvedDeps::from_metadata(&metadata);
+            (metadata, resolved)
+        };
 
         let processor = PackageProcessor::new(self.options.expand, self.options.check_test_targets);
-        let workspace_ctx = WorkspaceContext::new(&metadata)?;
+        let parse_cache = if self.options.cache {
+            executable_digest().map(|executable| {
+                let dir = CacheDir::new(
+                    metadata.target_directory.as_std_path(),
+                    metadata.workspace_root.as_std_path(),
+                );
+                let cache = ParseCache::load(&dir, &executable);
+                (dir, executable, cache)
+            })
+        } else {
+            None
+        };
+        let (workspace_ctx, parse_outcome) =
+            WorkspaceContext::new(&metadata, parse_cache.as_ref().map(|(_, _, cache)| cache))?;
+        if let Some((dir, executable, cache)) = &parse_cache {
+            self.cache_report.parsed_files = parse_outcome.entries.len();
+            self.cache_report.reused_files = parse_outcome.reused;
+            if cache.is_stale(parse_outcome.entries.iter()) {
+                let _ = parse_cache::store(dir, executable, parse_outcome.entries.iter());
+            }
+        }
 
         let packages = metadata.workspace_packages();
         let packages: Vec<_> = packages
@@ -389,7 +473,7 @@ impl<W: Write> CargoShear<W> {
                         total
                     );
 
-                    Self::process_package(&processor, &workspace_ctx, package, &metadata)
+                    Self::process_package(&processor, &workspace_ctx, package, &resolved)
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
@@ -397,7 +481,7 @@ impl<W: Write> CargoShear<W> {
             packages
                 .par_iter()
                 .map(|package| {
-                    Self::process_package(&processor, &workspace_ctx, package, &metadata)
+                    Self::process_package(&processor, &workspace_ctx, package, &resolved)
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -430,13 +514,94 @@ impl<W: Write> CargoShear<W> {
         Ok(())
     }
 
+    /// Run `cargo metadata` with full dependency resolution.
+    fn full_metadata(&self, extra_opts: &[String]) -> Result<Metadata> {
+        MetadataCommand::new()
+            .features(CargoOpt::AllFeatures)
+            .current_dir(&self.options.path)
+            .other_options(extra_opts.to_vec())
+            .verbose(true)
+            .exec()
+            .map_err(|e| anyhow::anyhow!("Metadata error: {e}"))
+    }
+
+    /// Obtain the workspace metadata and its resolved dependencies through the
+    /// resolution cache (see [`resolve_cache`]).
+    ///
+    /// `cargo metadata --no-deps` runs first and supplies the members, their
+    /// targets, and the primary key. On a hit, its metadata is used together
+    /// with the recorded resolution, and its warnings are passed through.
+    /// Otherwise the full `cargo metadata` runs exactly as it does without
+    /// `--cache`, and its result is recorded when it is safe to.
+    fn cached_metadata(&mut self, extra_opts: &[String]) -> Result<(Metadata, ResolvedDeps)> {
+        let started = SystemTime::now();
+        let flags = [self.options.locked, self.options.offline, self.options.frozen];
+        let context = KeyContext::capture(flags, &self.options.path);
+
+        let lookup = context.as_ref().and_then(|context| {
+            let output = MetadataCommand::new()
+                .features(CargoOpt::AllFeatures)
+                .no_deps()
+                .current_dir(&self.options.path)
+                .other_options(extra_opts.to_vec())
+                .cargo_command()
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = std::str::from_utf8(&output.stdout).ok()?;
+            let json = stdout.lines().find(|line| line.starts_with('{'))?;
+            let metadata = MetadataCommand::parse(json).ok()?;
+            let key = ResolveKey::compute(context, &metadata)?;
+            let dir = CacheDir::new(
+                metadata.target_directory.as_std_path(),
+                metadata.workspace_root.as_std_path(),
+            );
+            Some((metadata, key, dir, output.stderr))
+        });
+
+        let Some((mut no_deps, before, dir, warnings)) = lookup else {
+            self.cache_report.resolve = ResolveSource::Uncacheable;
+            let metadata = self.full_metadata(extra_opts)?;
+            let resolved = ResolvedDeps::from_metadata(&metadata);
+            return Ok((metadata, resolved));
+        };
+
+        if let Some(resolved) = resolve_cache::load(&dir, &before, &mut no_deps) {
+            let _ = io::stderr().write_all(&warnings);
+            self.cache_report.resolve = ResolveSource::Reused;
+            return Ok((no_deps, resolved));
+        }
+
+        let metadata = self.full_metadata(extra_opts)?;
+        let resolved = ResolvedDeps::from_metadata(&metadata);
+
+        self.cache_report.resolve = ResolveSource::Unrecorded;
+        if let Some(context) = &context
+            && let Some(after) = ResolveKey::compute(context, &metadata)
+            && after.digest == before.digest
+        {
+            let watched = Watched::collect(&metadata);
+            let mut newest = resolve_cache::newest_input(&before, &watched);
+            newest.merge(after.newest);
+            if newest.settled_before(started)
+                && resolve_cache::store(&dir, &before, &watched, &resolved, &metadata).is_some()
+            {
+                self.cache_report.resolve = ResolveSource::Recorded;
+            }
+        }
+
+        Ok((metadata, resolved))
+    }
+
     fn process_package<'a>(
         processor: &PackageProcessor,
         workspace_ctx: &'a WorkspaceContext,
         package: &Package,
-        metadata: &'a Metadata,
+        resolved: &ResolvedDeps,
     ) -> Result<(PackageContext<'a>, PackageAnalysis)> {
-        let ctx = PackageContext::new(workspace_ctx, package, metadata)?;
+        let ctx = PackageContext::new(workspace_ctx, package, resolved)?;
         let result = processor.process_package(&ctx)?;
         Ok((ctx, result))
     }

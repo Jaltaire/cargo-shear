@@ -11,7 +11,13 @@ use ignore::{DirEntry, WalkBuilder};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{manifest::Manifest, source_parser::ParsedSource, util::read_to_string};
+use crate::{
+    manifest::Manifest,
+    parse_cache::{ParseCache, ParseEntry},
+    resolve_cache::ResolvedDeps,
+    source_parser::ParsedSource,
+    util::read_to_string,
+};
 
 /// Marker that `cargo hakari` writes into a `workspace-hack` crate's `Cargo.toml`
 /// to delimit its generated dependency section. Its presence uniquely identifies
@@ -51,8 +57,23 @@ pub struct WorkspaceContext {
     pub hakari_packages: FxHashSet<String>,
 }
 
+/// What parsing through a [`ParseCache`] produced: the entry recorded for every
+/// parsed file, and how many of them were reused.
+#[derive(Debug, Default)]
+pub struct ParseOutcome {
+    /// Every parsed file's cache entry, keyed by absolute path.
+    pub entries: FxHashMap<PathBuf, ParseEntry>,
+    /// How many files were reused from the cache rather than parsed.
+    pub reused: usize,
+}
+
 impl WorkspaceContext {
-    pub fn new(metadata: &Metadata) -> Result<Self> {
+    /// Build the workspace context, parsing source files through
+    /// `parse_cache` when given. The context is identical either way.
+    pub fn new(
+        metadata: &Metadata,
+        parse_cache: Option<&ParseCache>,
+    ) -> Result<(Self, ParseOutcome)> {
         let root = metadata.workspace_root.as_std_path().to_path_buf();
 
         let manifest_path = root.join("Cargo.toml");
@@ -115,13 +136,7 @@ impl WorkspaceContext {
         let paths: FxHashSet<PathBuf> =
             entry_points.iter().filter(|path| path.is_file()).cloned().chain(walked).collect();
 
-        let files: FxHashMap<PathBuf, ParsedSource> = paths
-            .into_par_iter()
-            .filter_map(|path| {
-                let is_entry_point = entry_points.contains(&path);
-                ParsedSource::from_path(&path, is_entry_point).ok().map(|source| (path, source))
-            })
-            .collect();
+        let (files, outcome) = Self::parse_files(paths, &entry_points, parse_cache);
 
         let linked: FxHashSet<PathBuf> = entry_points
             .into_iter()
@@ -160,18 +175,56 @@ impl WorkspaceContext {
 
         let hakari_packages = Self::detect_hakari_packages(metadata);
 
-        Ok(Self {
-            root,
-            manifest_path,
-            manifest_content,
-            manifest,
-            files,
-            linked,
-            packages,
-            dep_to_pkg,
-            ignored_deps,
-            hakari_packages,
-        })
+        Ok((
+            Self {
+                root,
+                manifest_path,
+                manifest_content,
+                manifest,
+                files,
+                linked,
+                packages,
+                dep_to_pkg,
+                ignored_deps,
+                hakari_packages,
+            },
+            outcome,
+        ))
+    }
+
+    /// Parse every source file, through `parse_cache` when given.
+    fn parse_files(
+        paths: FxHashSet<PathBuf>,
+        entry_points: &FxHashSet<PathBuf>,
+        parse_cache: Option<&ParseCache>,
+    ) -> (FxHashMap<PathBuf, ParsedSource>, ParseOutcome) {
+        let mut outcome = ParseOutcome::default();
+        let Some(parse_cache) = parse_cache else {
+            let files = paths
+                .into_par_iter()
+                .filter_map(|path| {
+                    let is_entry_point = entry_points.contains(&path);
+                    ParsedSource::from_path(&path, is_entry_point).ok().map(|source| (path, source))
+                })
+                .collect();
+            return (files, outcome);
+        };
+
+        let parsed: Vec<_> = paths
+            .into_par_iter()
+            .filter_map(|path| {
+                let is_entry_point = entry_points.contains(&path);
+                parse_cache.parse(&path, is_entry_point).map(|parsed| (path, parsed))
+            })
+            .collect();
+
+        let mut files = FxHashMap::default();
+        for (path, parsed) in parsed {
+            outcome.reused += usize::from(parsed.reused);
+            outcome.entries.insert(path.clone(), parsed.entry);
+            files.insert(path, parsed.source);
+        }
+        (files, outcome)
     }
 
     /// Identify the workspace members that are `cargo hakari` `workspace-hack`
@@ -223,22 +276,13 @@ impl<'a> PackageContext<'a> {
     pub fn new(
         workspace: &'a WorkspaceContext,
         package: &Package,
-        metadata: &Metadata,
+        resolved: &ResolvedDeps,
     ) -> Result<Self> {
         let manifest_path = package.manifest_path.as_std_path();
         let manifest_content = read_to_string(manifest_path)?;
         let manifest: Manifest = toml::from_str(&manifest_content)?;
 
-        let resolved = metadata
-            .resolve
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow!("`cargo_metadata::MetadataCommand::no_deps` should not be called.")
-            })?
-            .nodes
-            .iter()
-            .find(|node| node.id == package.id)
-            .ok_or_else(|| anyhow!("Package not found: {}", package.name))?;
+        let resolved = resolved.deps(package)?;
 
         let directory = manifest_path
             .parent()
@@ -248,15 +292,9 @@ impl<'a> PackageContext<'a> {
         let mut import_to_pkg = FxHashMap::default();
         let mut pkg_to_import = FxHashMap::default();
 
-        for dep in &resolved.deps {
-            if let Some(pkg) = metadata.packages.iter().find(|package| package.id == dep.pkg) {
-                // Artifact/bindep dependencies have an empty `dep.name` in `cargo_metadata`.
-                // Fall back to the package name so the rest of the pipeline can match them.
-                let name =
-                    if dep.name.is_empty() { pkg.name.replace('-', "_") } else { dep.name.clone() };
-                import_to_pkg.insert(name.clone(), pkg.name.to_string());
-                pkg_to_import.insert(pkg.name.to_string(), name);
-            }
+        for dep in resolved {
+            import_to_pkg.insert(dep.import.clone(), dep.package.clone());
+            pkg_to_import.insert(dep.package.clone(), dep.import.clone());
         }
 
         // A package ignore applies only to its own package; a workspace ignore applies
