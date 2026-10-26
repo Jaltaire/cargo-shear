@@ -2572,3 +2572,180 @@ fn github_output_format() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+fn workspace_from_fixture(fixture: &str) -> Result<(TempDir, std::path::PathBuf), Box<dyn Error>> {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(fixture);
+    let dir = TempDir::new()?;
+    let root = dir.path().canonicalize()?.join(fixture);
+    CargoShearRunner::copy_dir_recursive(&source, &root)?;
+    Ok((dir, root))
+}
+
+fn shear_command(workspace: &Path, cache: bool) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-shear"));
+    command.arg("--color=never");
+    if cache {
+        command.arg("--cache");
+    }
+    command
+        .arg(workspace)
+        .current_dir(workspace)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("GITHUB_ACTIONS");
+    command
+}
+
+fn assert_succeeded(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "cargo-shear failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_shear(workspace: &Path, cache: bool) -> Result<(), Box<dyn Error>> {
+    assert_succeeded(&shear_command(workspace, cache).output()?);
+    Ok(())
+}
+
+fn cargo_built_target() -> Result<(TempDir, std::path::PathBuf), Box<dyn Error>> {
+    let dir = TempDir::new()?;
+    let root = dir.path().canonicalize()?;
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"tagged\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src/lib.rs"), "")?;
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--offline", "--quiet"])
+        .current_dir(&root)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .status()?;
+    assert!(status.success(), "cargo build failed.");
+    let target = root.join("target");
+    Ok((dir, target))
+}
+
+fn excluded_from_time_machine(path: &Path) -> Result<Option<bool>, Box<dyn Error>> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let output = std::process::Command::new("tmutil").arg("isexcluded").arg(path).output()?;
+    assert!(output.status.success(), "tmutil isexcluded failed.");
+    Ok(Some(String::from_utf8(output.stdout)?.contains("[Excluded]")))
+}
+
+fn assert_marked_as_cargo_marks(target: &Path) -> Result<(), Box<dyn Error>> {
+    let (_cargo_dir, cargo_target) = cargo_built_target()?;
+    let ours = fs::read(target.join("CACHEDIR.TAG"))?;
+    let cargos = fs::read(cargo_target.join("CACHEDIR.TAG"))?;
+    assert!(
+        ours.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55\n"),
+        "The tag does not start with the cache directory signature."
+    );
+    assert_eq!(ours, cargos, "The tag differs from the one cargo writes.");
+    assert_eq!(
+        excluded_from_time_machine(target)?,
+        excluded_from_time_machine(&cargo_target)?,
+        "Time Machine treats the target directory differently from one cargo created."
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            excluded_from_time_machine(target)?,
+            Some(true),
+            "Time Machine does not exclude the target directory."
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn cached_runs_create_the_target_directory_as_cargo_does() -> Result<(), Box<dyn Error>> {
+    let (_dir, workspace) = workspace_from_fixture("clean")?;
+    let target = workspace.join("target");
+
+    run_shear(&workspace, true)?;
+
+    assert_marked_as_cargo_marks(&target)?;
+    assert!(target.join("cargo-shear").is_dir());
+    Ok(())
+}
+
+#[test]
+fn cached_runs_create_a_configured_target_directory_and_its_parents() -> Result<(), Box<dyn Error>>
+{
+    let (_dir, workspace) = workspace_from_fixture("clean")?;
+    fs::create_dir_all(workspace.join(".cargo"))?;
+    fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[build]\ntarget-dir = \"out/nested/target\"\n",
+    )?;
+    let target = workspace.join("out/nested/target");
+
+    run_shear(&workspace, true)?;
+
+    assert_marked_as_cargo_marks(&target)?;
+    assert!(target.join("cargo-shear").is_dir());
+    assert!(!workspace.join("target").exists());
+    Ok(())
+}
+
+#[test]
+fn concurrent_cached_runs_create_a_shared_target_directory_once() -> Result<(), Box<dyn Error>> {
+    let shared = TempDir::new()?;
+    let parent = shared.path().canonicalize()?;
+    let target = parent.join("target");
+    let workspaces =
+        (0..8).map(|_| workspace_from_fixture("clean")).collect::<Result<Vec<_>, _>>()?;
+
+    let children = workspaces
+        .iter()
+        .map(|(_, workspace)| {
+            shear_command(workspace, true)
+                .env("CARGO_TARGET_DIR", &target)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for child in children {
+        assert_succeeded(&child.wait_with_output()?);
+    }
+
+    assert_marked_as_cargo_marks(&target)?;
+    let siblings: Vec<_> = fs::read_dir(&parent)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(siblings, ["target"]);
+    assert_eq!(fs::read_dir(target.join("cargo-shear"))?.count(), workspaces.len());
+    Ok(())
+}
+
+#[test]
+fn uncached_runs_never_create_the_target_directory() -> Result<(), Box<dyn Error>> {
+    let (_dir, workspace) = workspace_from_fixture("clean")?;
+
+    run_shear(&workspace, false)?;
+
+    assert!(!workspace.join("target").exists());
+    Ok(())
+}
+
+#[test]
+fn cached_runs_leave_an_existing_target_directory_as_cargo_does() -> Result<(), Box<dyn Error>> {
+    let (_dir, workspace) = workspace_from_fixture("clean")?;
+    let target = workspace.join("target");
+    fs::create_dir_all(&target)?;
+    fs::write(target.join("kept"), "kept\n")?;
+
+    run_shear(&workspace, true)?;
+
+    assert_eq!(fs::read_to_string(target.join("kept"))?, "kept\n");
+    assert!(!target.join("CACHEDIR.TAG").exists());
+    assert!(target.join("cargo-shear").is_dir());
+    Ok(())
+}

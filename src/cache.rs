@@ -23,6 +23,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use cargo_util::paths;
+
 /// A BLAKE3 digest.
 pub type Digest = [u8; 32];
 
@@ -121,8 +123,12 @@ pub fn from_hex(hex: &str) -> Option<Digest> {
 ///
 /// Living under the target directory means `cargo clean` discards it, and the
 /// per-root subdirectory keeps workspaces that share a target directory apart.
+/// A run that comes before cargo's first build creates the target directory
+/// as cargo does, so that it still carries `CACHEDIR.TAG` and is excluded from
+/// backups: cargo marks only a target directory it creates itself.
 #[derive(Debug, Clone)]
 pub struct CacheDir {
+    target_directory: PathBuf,
     path: PathBuf,
 }
 
@@ -131,7 +137,10 @@ impl CacheDir {
         let root = Fingerprint::new("cargo-shear workspace root").path(workspace_root).finish();
         let name = to_hex(&root);
         let name = name.get(..32).unwrap_or(&name);
-        Self { path: target_directory.join("cargo-shear").join(name) }
+        Self {
+            target_directory: target_directory.to_path_buf(),
+            path: target_directory.join("cargo-shear").join(name),
+        }
     }
 
     #[cfg(all(test, unix))]
@@ -146,8 +155,11 @@ impl CacheDir {
 
     /// Replace a cache file atomically: write a sibling temporary file, then
     /// rename it over the old one, so a concurrent reader sees either the old
-    /// contents or the new, never a mixture.
+    /// contents or the new, never a mixture. A missing target directory is
+    /// first created as cargo creates it.
     pub fn write(&self, name: &str, contents: &[u8]) -> io::Result<()> {
+        paths::create_dir_all_excluded_from_backups_atomic(&self.target_directory)
+            .map_err(io::Error::other)?;
         fs::create_dir_all(&self.path)?;
         let temporary = self.path.join(format!(".{name}.{}.tmp", process::id()));
         fs::write(&temporary, contents)?;
